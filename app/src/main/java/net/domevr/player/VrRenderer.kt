@@ -1,0 +1,1390 @@
+package net.domevr.player
+
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.SurfaceTexture
+import android.opengl.GLES11Ext
+import android.opengl.GLES20
+import android.opengl.GLUtils
+import android.opengl.Matrix
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.FloatBuffer
+import javax.microedition.khronos.egl.EGLConfig
+import javax.microedition.khronos.opengles.GL10
+
+/**
+ * Stereo renderer: split-screen left/right with head-tracked view.
+ *
+ * VIDEO: ExoPlayer frame (OES texture) on plane / sphere segment.
+ * BROWSER: Canvas-rendered file/settings list on a world-locked panel.
+ *
+ * Gaze is a real head-forward ray intersected with the panel plane, so the
+ * head-locked reticle actually hovers rows. Staring [dwellMs] activates.
+ * All optics (FOV, IPD, swap, zoom, panel distance) are live fields fed
+ * from SettingsStore by the activity.
+ */
+class VrRenderer(
+    private val onBrowserActivate: (Int, Float?) -> Unit,
+    private val onMenuEvent: (MenuEvent) -> Unit = {}
+) : android.opengl.GLSurfaceView.Renderer, SurfaceTexture.OnFrameAvailableListener {
+
+    enum class Mode { BROWSER, VIDEO }
+
+    /** Play-menu actions. Press(idx): 0 prev, 1 rewind, 2 play/pause, 3 fast-forward,
+     *  4 next, 5 settings, 6 vol+, 7 vol-, 8 zoom-, 9 zoom+, 10 files.
+     *  Seek(frac): jump to fraction. */
+    sealed class MenuEvent {
+        data class Press(val idx: Int) : MenuEvent()
+        data class Seek(val frac: Float) : MenuEvent()
+    }
+
+    @Volatile var mode: Mode = Mode.BROWSER
+    @Volatile var projection: Projection = Projection.DEG180
+    @Volatile var stereo: Stereo = Stereo.SBS
+    @Volatile var fovDeg: Float = 68f
+    @Volatile var eyeHalfM: Float = 0.032f
+    @Volatile var swapEyes: Boolean = false
+    @Volatile var zoom: Float = 1f
+    @Volatile var panelDistM: Float = 2.4f
+    @Volatile var dwellMs: Long = 1500L
+    /** Pin video dead-ahead (screen lock); browser always look-around. */
+    @Volatile var pinVideo: Boolean = false
+    /**
+     * Diagnostics: ignore the sensors and drive tracking with a scripted
+     * sweep (yaw ±35°/10s + pitch ±12°/7s). If the image pans level in sweep
+     * mode but rotates on your real head, the sensors (not the math) lie.
+     */
+    @Volatile var testSweep: Boolean = false
+    private var lastTestSweep = false
+    private var sweepT0 = 0L
+
+    var videoTextureId: Int = -1
+    /** Bumped every onSurfaceCreated. If ExoPlayer is still targeting an
+     *  older surface (EGL context loss recreates it silently), its frames
+     *  go nowhere: frozen picture, advancing position, zero errors. The
+     *  activity watches this generation and re-attaches on change. */
+    @Volatile var surfaceGen = 0
+    /** Frames completed (GL thread). Watchdog reads it: advancing = GL
+     *  alive; frozen + frozen video = GL stuck (GPU hang/surface stall). */
+    @Volatile var frameCount = 0L
+        private set
+    /** Video frames actually consumed from the decoder (updateTexImage ran).
+     *  The discriminator: glfps high + consumed frozen = decoder stopped
+     *  delivering (input starvation/track end); both frozen = GL stalled. */
+    @Volatile var consumedFrames = 0L
+        private set
+    /** onFrameAvailable firings (binder thread). arrivals frozen + renderer
+     *  counters climbing = queue/listener stopped delivering despite output;
+     *  arrivals flowing + consumed frozen = consumption broken. */
+    @Volatile var arrivedFrames = 0L
+        private set
+    var surfaceTexture: SurfaceTexture? = null
+        private set
+    var surface: android.view.Surface? = null
+        private set
+    // Written by the BufferQueue binder thread (onFrameAvailable), read by the
+    // GL thread every frame. MUST be volatile: without it the GL thread may
+    // stop seeing new frames after JIT recompiles the read (seconds in) —
+    // frozen video, healthy audio/position/buffers, zero errors. This exact
+    // failure froze every video at varying 5-15s until found.
+    @Volatile private var frameAvailable = false
+
+    @Volatile var browserTitle: String = "/"
+    @Volatile var browserRows: List<BrowserRow> = emptyList()
+    /** A row can carry a gaze slider: dwelling at horizontal fraction u
+     *  sets value = min + u·(max-min). One dwell reaches any value. */
+    data class BrowserRow(
+        val label: String, val meta: String, val kind: Int,
+        val slideKey: String? = null,
+        val slideMin: Float = 0f,
+        val slideMax: Float = 1f,
+        val slideVal: Float = 0f
+    ) {
+        companion object {
+            const val FOLDER = 0; const val VIDEO = 1; const val FILE = 2; const val ACTION = 3
+        }
+    }
+
+    // highlight index into FULL rows list
+    private var highlight = -1
+    private var scroll = 0
+    private var dwellStart = 0L
+    private var dwellFiredFor = -2
+    fun tapSelect() { val h = highlight; if (h in browserRows.indices) onBrowserActivate(h, null) }
+    fun moveHighlight(d: Int) {
+        val n = browserRows.size
+        if (n == 0) return
+        highlight = ((if (highlight < 0) n / 2 else highlight) + d).coerceIn(0, n - 1)
+        ensureVisible()
+        dwellStart = now(); dwellFiredFor = -2
+    }
+
+    private val rawM = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
+    private val effM = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
+    /** Rendered camera-forward, refreshed every frame (for the trace recorder). */
+    @Volatile var lastEffFwd = floatArrayOf(0f, 0f, -1f)
+    /** Rendered head-up, refreshed every frame. Drives the menu trigger. */
+    @Volatile var lastEffUp = floatArrayOf(0f, 1f, 0f)
+    // Recenter basis: R0 = raw pose at snap, Sb = screen frame in device
+    // coords at snap (frozen). Effective view = Stb · R0t · R · Sb.
+    // Sb is deliberately FROZEN at snap, not re-derived live: re-deriving
+    // from live gravity makes the output frame swim whenever the yaw axis
+    // isn't world-vertical (reclined viewer), which reads as image roll
+    // during head turns. A fixed frame keeps relative motion exact.
+    private val r0M = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
+    private val r0tM = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
+    private val sbM = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
+    private val stbM = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
+    private val tmpA = FloatArray(16)
+    private val tmpB = FloatArray(16)
+    // NOTE: no upright/roll lock here, deliberately. Full 3DOF look-around:
+    // yaw, pitch AND roll all track the head (world-locked, like GVR),
+    // so rolling the head counter-rotates the image and the world stays put.
+    // (An earlier upright constraint glued roll and was removed per request.)
+    // Volatile: sensor callbacks may run on a different thread than taps and
+    // lifecycle calls. A stale read here re-snaps the basis every event and
+    // glues the world to the face (tracking gain collapses to ~0).
+    @Volatile private var hasBasis = false
+    /** Cause tag for the next snap (entry/files/video/tap/auto). Audit trail:
+     *  repeated unprompted auto-snaps mean the reference frame is chasing
+     *  the head, which glues/drags the world. */
+    @Volatile private var snapTag = "auto"
+    // NOTE: yaw/pitch/roll all flow through the matrix path (full 3DOF
+    // world-lock). An earlier gyro-direct yaw drive was removed: unbounded
+    // gyro drift made the image wander, and it blinded the turn diagnostic.
+    /** Successful basis snaps since creation (debug overlay). */
+    @Volatile var snapCount = 0
+        private set
+
+    /** Locked copy of the current effective view matrix (debug overlay). */
+    fun effCopy(): FloatArray = synchronized(rawM) { effM.clone() }
+
+    /** Latest sensor reading. First upright reading becomes the forward basis,
+     *  so the view starts centered wherever the phone is pointing. */
+    fun setHeadMatrix(m: FloatArray) {
+        if (testSweep) return // sweep mode owns rawM on the GL thread
+        synchronized(rawM) { System.arraycopy(m, 0, rawM, 0, 16) }
+        if (!hasBasis) recenter(snapTag)
+    }
+
+    /** Snap "forward" to the current head pose. Call on tap and on entering VR.
+     *  Returns false when the phone is flat: the snap is deferred until the
+     *  next upright reading (setHeadMatrix retries automatically). */
+    fun recenter(why: String = "auto"): Boolean {
+        if (testSweep) return true // fixed canonical basis, nothing to snap
+        var ok = false
+        synchronized(rawM) {
+            // Only commit the snap when the screen frame is derivable;
+            // a flat-phone snap would freeze a degenerate frame.
+            if (deriveScreenFrame(rawM, sbM)) {
+                System.arraycopy(rawM, 0, r0M, 0, 16)
+                Matrix.transposeM(r0tM, 0, r0M, 0)
+                Matrix.transposeM(stbM, 0, sbM, 0)
+                if (!hasBasis) { android.util.Log.d("DomeVR-basis", "basis snapped ($why)"); FileLog.d("DomeVR-basis", "basis snapped ($why)") }
+                hasBasis = true
+                snapCount++
+                snapTag = "auto"
+                ok = true
+            } else {
+                hasBasis = false // try again on the next reading
+            }
+        }
+        inputGraceUntil = now() + 800
+        return ok
+    }
+
+    /**
+     * Screen frame (in device coords) from gravity. R maps device→world, so
+     * world-up in device coords is Rᵀ·ẑ, i.e. row 2 = elements (r[2], r[6]).
+     * (Column 2, (r[8], r[9]), is the screen normal in world coords — using
+     * that swaps yaw and pitch in landscape, which makes panning roll the
+     * image.) Works in portrait, either landscape, or upside-down.
+     * Returns false when the phone is flat (no usable in-plane up).
+     */
+    private fun deriveScreenFrame(r: FloatArray, s: FloatArray): Boolean {
+        var ux = r[2]; var uy = r[6] // world-up projected into screen plane
+        val n = kotlin.math.sqrt(ux * ux + uy * uy)
+        if (n < 0.25f) return false
+        ux /= n; uy /= n
+        // columns: screen-right = up × out, screen-up, screen-out
+        s[0] = uy; s[1] = -ux; s[2] = 0f; s[3] = 0f
+        s[4] = ux; s[5] = uy; s[6] = 0f; s[7] = 0f
+        s[8] = 0f; s[9] = 0f; s[10] = 1f; s[11] = 0f
+        s[12] = 0f; s[13] = 0f; s[14] = 0f; s[15] = 1f
+        return true
+    }
+
+    /** View = world→camera = (Stb · R0t · R · Sb)ᵀ, all frozen at snap.
+     *  Caller must hold rawM's monitor. Full 3DOF: yaw, pitch and roll all
+     *  flow through (gyro drive re-anchors yaw); no upright lock. */
+    private fun computeEffLocked(raw: FloatArray, eff: FloatArray) {
+        Matrix.multiplyMM(tmpA, 0, r0tM, 0, raw, 0) // device-frame relative
+        Matrix.multiplyMM(tmpB, 0, tmpA, 0, sbM, 0)
+        Matrix.multiplyMM(tmpA, 0, stbM, 0, tmpB, 0)
+        // transpose: raw sensor R maps device→world, but a GL view matrix
+        // must map world→camera.
+        Matrix.transposeM(eff, 0, tmpA, 0)
+    }
+
+    /** Forget the basis so the next sensor reading re-centers (enter VR / play).
+     *  The tag audits WHY the next snap happens (entry/files/video). */
+    fun resetBasis(tag: String = "auto") {
+        if (testSweep) return
+        snapTag = tag
+        hasBasis = false
+        inputGraceUntil = now() + 2500
+    }
+
+    @Volatile private var inputGraceUntil = 0L
+
+    private var progOes = 0; private var prog2d = 0
+    private var aPosOes = 0; private var aTexOes = 0; private var uMvpOes = 0
+    private var uTexOes = 0; private var uStereoOes = 0; private var uEyeOes = 0; private var uZoomOes = 0
+    private var uWarpOnOes = 0; private var uWarpCxOes = 0; private var uWarpK1Oes = 0; private var uWarpK2Oes = 0; private var uWarpAspectOes = 0
+    private var uWarpOn2d = 0; private var uWarpCx2d = 0; private var uWarpK12d = 0; private var uWarpK22d = 0; private var uWarpAspect2d = 0
+    private var aPos2d = 0; private var aTex2d = 0; private var uMvp2d = 0; private var uTex2d = 0
+
+    private var mesh: Mesh? = null
+    private var meshKey: String = ""
+    private var browserTexId = -1
+    private var browserBitmap: Bitmap? = null
+    private var lastPanelHash = 0
+    private var reticleTexId = -1
+
+    private val projM = FloatArray(16)
+    private val projEyeM = FloatArray(16)
+    // Video shares the plain projection now: zoom crops UVs in FRAG_OES,
+    // so the frustum (and all perspective/motion feel) never changes.
+    private val videoProjM = FloatArray(16)
+    private val projEyeVM = FloatArray(16)
+    private val viewM = FloatArray(16)
+    /** Per-eye convergence shift, NDC units (half-screen spans 2.0).
+     *  >0 pulls both image centers toward the middle (for narrow IPD).
+     *  Computed in applyOptics as (1 - ipd/spacing). */
+    @Volatile var convShiftNdc = 0f
+    /** Play-menu gesture: look pitch (deg) that opens the menu. Positive =
+     *  look up, negative = look down. Hysteresis 12°. */
+    @Volatile var menuAngleDeg = 65f
+    /** True while the play menu is shown (VIDEO mode only). */
+    @Volatile var menuOpen = false
+    /** Transient in-VR message on the menu panel (Toasts are invisible
+     *  in the headset). Activity sets text; visible ~2s. */
+    @Volatile var menuFlash = ""
+    @Volatile var menuFlashUntil = 0L
+    fun flashMenu(msg: String, ms: Long = 2000L) {
+        menuFlash = msg
+        menuFlashUntil = System.currentTimeMillis() + ms
+    }
+    /** Playback position/duration/state for the menu progress bar. */
+    @Volatile var menuPosMs = 0L
+    @Volatile var menuDurMs = 0L
+    @Volatile var menuPlaying = true
+    // menu gaze state (GL thread)
+    private var menuHighlight = -2 // -1 = seek bar, 0..10 buttons
+    private var menuDwellFiredFor = -3
+    private var menuHitValid = false
+    private var menuHitW = FloatArray(3)
+    /** Last panel hit, kept while the menu is open: the pointer tracks the
+     *  gaze even mid-motion instead of flickering off. */
+    private var menuStickyValid = false
+    private var menuStickyW = FloatArray(3)
+    private var menuTexId = 0
+    private var menuBitmap: Bitmap? = null
+    private var lastMenuHash = 0
+    private var menuDwellPrevInit = false
+    private val menuDwellPrevM = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
+    private var menuDwellPrevT = 0L
+    /** When the gaze first dropped below the open angle (0 = above it).
+     *  Closing needs 400ms continuously below: sensor noise at the exact
+     *  threshold must not strobe the menu (and reset every dwell). */
+    private var menuBelowSince = 0L
+    private var menuWasOpen = false
+    private var menuProgFresh = true
+    /** Cardboard lens distortion coefficients (0..1, standard Cardboard). */
+    @Volatile var lensK1 = 0.34f
+    @Volatile var lensK2 = 0.55f
+    // Distortion runs as a FINAL pass on a flat quad (never on scene
+    // geometry): warping scene vertices breaks GPU clipping where the
+    // dome crosses behind the camera, fanning streaks across the screen.
+    // Eye buffer supersampled 2x with mipmaps + anisotropy: plain bilinear
+    // minifies by point-sampling (chunky "lego" aliasing on 4K/8K sources),
+    // while a mipmapped supersample minifies smoothly. Per-eye cost is
+    // one RGBA blit + mipmap gen; fine on modern GPUs.
+    private val FBO_SCALE = 2
+    private var fboId = 0
+    private var fboTexId = 0
+    private var fboW = 0
+    private var fboH = 0
+    private var fboOk = false
+    private var progDist = 0
+    private var aPosDist = 0
+    private var aTexDist = 0
+    private var uMvpDist = 0
+    private var uTexDist = 0
+    private var uK1Dist = 0
+    private var uK2Dist = 0
+    private var uAspectDist = 0
+    private val identM = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
+    private val flatM = FloatArray(16) // proj · eff: rotation-only UI matrix
+    private val mvpM = FloatArray(16)
+    private val tmpM = FloatArray(16)
+
+    @Volatile var lastWidth = 1
+    @Volatile var lastHeight = 1
+
+    companion object {
+        const val VISIBLE_ROWS = 12
+        const val MENU_BUTTONS = 11
+        const val TEX = 1024
+        const val ROWS_Y0 = 150
+        const val ROW_H = 64
+
+        private const val VERT = """
+attribute vec4 aPos; attribute vec2 aTex; varying vec2 vTex; uniform mat4 uMvp;
+uniform float uWarpOn; uniform float uWarpCx; uniform float uWarpK1; uniform float uWarpK2; uniform float uWarpAspect;
+void main(){
+  vTex = aTex;
+  vec4 p = uMvp * aPos;
+  float w = p.w;
+  if (uWarpOn > 0.5) {
+    if (w > 0.0) {
+      float nx = p.x / w;
+      float ny = p.y / w;
+      float dx = (nx - uWarpCx) * uWarpAspect;
+      float r2 = dx * dx + ny * ny;
+      float s = 1.0 / (1.0 + uWarpK1 * r2 + uWarpK2 * r2 * r2);
+      nx = uWarpCx + dx * s / uWarpAspect;
+      ny = ny * s;
+      p.x = nx * w;
+      p.y = ny * w;
+    }
+  }
+  gl_Position = p;
+}
+"""
+        // highp UVs when available: mediump quantizes texture coordinates
+        // to ~1024 steps, i.e. 8-texel blocks on 8K video ("lego").
+        private const val FRAG_OES = """
+#extension GL_OES_EGL_image_external : require
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+varying vec2 vTex;
+uniform samplerExternalOES uTex; uniform int uStereo; uniform int uEye; uniform float uZoom;
+void main(){
+  vec2 t = vTex;
+  if (uStereo == 1) { t.x = (t.x + float(uEye)) * 0.5; }
+  else if (uStereo == 2) { t.y = (t.y + float(uEye)) * 0.5; }
+  // zoom crops the picture, not the frustum: magnify content about the
+  // half-image center (each SBS/OU half is its own picture). Outside the
+  // frame paints black (shrunken screen on flat, void on domes). Unlike
+  // FOV zoom this never distorts perspective, at any value.
+  vec2 c = vec2(0.5);
+  if (uStereo == 1) { c = vec2(float(uEye) * 0.5 + 0.25, 0.5); }
+  else if (uStereo == 2) { c = vec2(0.5, float(uEye) * 0.5 + 0.25); }
+  t = c + (t - c) / uZoom;
+  if (t.x < 0.0 || t.x > 1.0 || t.y < 0.0 || t.y > 1.0) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+  gl_FragColor = texture2D(uTex, t);
+}
+"""
+        private const val FRAG_2D = """
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+varying vec2 vTex; uniform sampler2D uTex;
+void main(){ gl_FragColor = texture2D(uTex, vTex); }
+"""
+        // Final-pass lens warp (per-pixel, on a flat quad at safe depth):
+        // radial barrel offsets the sample outward (edges magnified, like
+        // the real lens); sampling outside the eye image paints black,
+        // carving the curved lens boundary. k1/k2 span 0..1.
+        private const val FRAG_DIST = """
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+varying vec2 vTex;
+uniform sampler2D uTex; uniform float uK1; uniform float uK2; uniform float uAspect;
+void main(){
+  vec2 c = vTex - vec2(0.5);
+  vec2 d = vec2(c.x * uAspect, c.y);
+  float r2 = dot(d, d);
+  float s = 1.0 + uK1 * r2 + uK2 * r2 * r2;
+  vec2 sc = vec2(0.5) + vec2(d.x * s / uAspect, d.y * s);
+  if (sc.x < 0.0 || sc.x > 1.0 || sc.y < 0.0 || sc.y > 1.0) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+  gl_FragColor = texture2D(uTex, sc);
+}
+"""
+    }
+
+    override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+        // Black: the warped meshes cover less than the viewport, and the
+        // lens boundary must read as darkness, like real VR software.
+        GLES20.glClearColor(0f, 0f, 0f, 1f)
+        // Alpha blending for the pointer ring (transparent bitmap
+        // background). Opaque content (video, panels) has alpha 1, so this
+        // is a no-op for everything except the pointer.
+        GLES20.glEnable(GLES20.GL_BLEND)
+        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+        progOes = buildProgram(VERT, FRAG_OES)
+        aPosOes = GLES20.glGetAttribLocation(progOes, "aPos")
+        aTexOes = GLES20.glGetAttribLocation(progOes, "aTex")
+        uMvpOes = GLES20.glGetUniformLocation(progOes, "uMvp")
+        uTexOes = GLES20.glGetUniformLocation(progOes, "uTex")
+        uStereoOes = GLES20.glGetUniformLocation(progOes, "uStereo")
+        uEyeOes = GLES20.glGetUniformLocation(progOes, "uEye")
+        uZoomOes = GLES20.glGetUniformLocation(progOes, "uZoom")
+        uWarpOnOes = GLES20.glGetUniformLocation(progOes, "uWarpOn")
+        uWarpCxOes = GLES20.glGetUniformLocation(progOes, "uWarpCx")
+        uWarpK1Oes = GLES20.glGetUniformLocation(progOes, "uWarpK1")
+        uWarpK2Oes = GLES20.glGetUniformLocation(progOes, "uWarpK2")
+        uWarpAspectOes = GLES20.glGetUniformLocation(progOes, "uWarpAspect")
+        prog2d = buildProgram(VERT, FRAG_2D)
+        aPos2d = GLES20.glGetAttribLocation(prog2d, "aPos")
+        aTex2d = GLES20.glGetAttribLocation(prog2d, "aTex")
+        uMvp2d = GLES20.glGetUniformLocation(prog2d, "uMvp")
+        uTex2d = GLES20.glGetUniformLocation(prog2d, "uTex")
+        uWarpOn2d = GLES20.glGetUniformLocation(prog2d, "uWarpOn")
+        uWarpCx2d = GLES20.glGetUniformLocation(prog2d, "uWarpCx")
+        uWarpK12d = GLES20.glGetUniformLocation(prog2d, "uWarpK1")
+        uWarpK22d = GLES20.glGetUniformLocation(prog2d, "uWarpK2")
+        uWarpAspect2d = GLES20.glGetUniformLocation(prog2d, "uWarpAspect")
+        progDist = buildProgram(VERT, FRAG_DIST)
+        aPosDist = GLES20.glGetAttribLocation(progDist, "aPos")
+        aTexDist = GLES20.glGetAttribLocation(progDist, "aTex")
+        uMvpDist = GLES20.glGetUniformLocation(progDist, "uMvp")
+        uTexDist = GLES20.glGetUniformLocation(progDist, "uTex")
+        uK1Dist = GLES20.glGetUniformLocation(progDist, "uK1")
+        uK2Dist = GLES20.glGetUniformLocation(progDist, "uK2")
+        uAspectDist = GLES20.glGetUniformLocation(progDist, "uAspect")
+
+        val tex = IntArray(1)
+        GLES20.glGenTextures(1, tex, 0)
+        videoTextureId = tex[0]
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, videoTextureId)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        surfaceTexture = SurfaceTexture(videoTextureId)
+        surfaceTexture?.setOnFrameAvailableListener(this)
+        surface = android.view.Surface(surfaceTexture)
+        surfaceGen++
+
+        GLES20.glGenTextures(1, tex, 0)
+        browserTexId = tex[0]
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, browserTexId)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+
+        reticleTexId = makeReticle()
+
+        GLES20.glGenTextures(1, tex, 0)
+        menuTexId = tex[0]
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, menuTexId)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+    }
+
+    override fun onSurfaceChanged(gl: GL10?, w: Int, h: Int) {}
+
+    override fun onDrawFrame(gl: GL10?) {
+        try {
+            drawFrameInner(gl)
+            frameCount++
+        } catch (e: Throwable) {
+            // An uncaught exception here kills the GL thread SILENTLY:
+            // frozen picture, advancing position, zero errors. Never again.
+            android.util.Log.e("DomeVR-GL", "onDrawFrame failed", e)
+            FileLog.e("DomeVR-GL", "onDrawFrame failed", e)
+        }
+    }
+
+    private var texFailCount = 0
+
+    private fun drawFrameInner(gl: GL10?) {
+        // Consume UNCONDITIONALLY once any frame has ever arrived (VIDEO mode
+        // warms the queue within ~1s of start; before that stay flag-guarded
+        // so an empty queue never throws). Gating consumption on the flag
+        // deadlocks permanently: if the producer ever gets a frame ahead
+        // (ordinary jitter), its overflow replaces the queued frame SILENTLY
+        // (no onFrameAvailable), the flag stays false forever, we never
+        // consume, the queue never drains — frozen video, healthy audio,
+        // zero errors, both decoders, varying 5-25s. Latching the same frame
+        // an extra time is harmless; a stale slot is fatal. Never again.
+        surfaceTexture?.let { st ->
+            if (frameAvailable || (mode == Mode.VIDEO && arrivedFrames > 0)) {
+                try { st.updateTexImage(); if (frameAvailable) consumedFrames++ } catch (e: Throwable) { texFailCount++; if (texFailCount <= 3 || texFailCount % 300 == 0) { android.util.Log.e("DomeVR-GL", "updateTexImage failed #$texFailCount", e); FileLog.e("DomeVR-GL", "updateTexImage failed #$texFailCount", e) } }
+                frameAvailable = false
+            }
+        }
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        if (testSweep != lastTestSweep) {
+            lastTestSweep = testSweep
+            if (testSweep) {
+                // canonical basis: R0 = Sb = identity; sweep drives rawM directly
+                Matrix.setIdentityM(r0M, 0); Matrix.setIdentityM(r0tM, 0)
+                Matrix.setIdentityM(sbM, 0); Matrix.setIdentityM(stbM, 0)
+                hasBasis = true
+                sweepT0 = android.os.SystemClock.elapsedRealtime()
+            } else {
+                hasBasis = false // re-snap from the real sensors
+            }
+        }
+        if (testSweep) {
+            val t = (android.os.SystemClock.elapsedRealtime() - sweepT0) / 1000f
+            // yaw (about Y) ±12°/10s + pitch (about X) ±8°/7s + roll (about
+            // view axis Z) ±15°/13s. Small on purpose: the panel stays in
+            // frame so screenshots (or eyes) can judge each axis. Roll must
+            // spin the panel IN PLACE (centered, tilted); yaw/pitch pan it.
+            // NB: yaw is rotation about Y, NOT Z (Z is roll).
+            val yaw = 12f * kotlin.math.sin(2 * Math.PI.toFloat() * t / 10f)
+            val pitch = 8f * kotlin.math.sin(2 * Math.PI.toFloat() * t / 7f + 1.3f)
+            val roll = 15f * kotlin.math.sin(2 * Math.PI.toFloat() * t / 13f + 2.1f)
+            Matrix.setIdentityM(rawM, 0)
+            Matrix.rotateM(rawM, 0, yaw, 0f, 1f, 0f)
+            Matrix.rotateM(rawM, 0, pitch, 1f, 0f, 0f)
+            Matrix.rotateM(rawM, 0, roll, 0f, 0f, 1f)
+        }
+        val w = lastWidth.coerceAtLeast(1); val h = lastHeight.coerceAtLeast(1)
+        Matrix.perspectiveM(projM, 0, fovDeg.coerceIn(40f, 110f), (w / 2f) / h, 0.1f, 100f)
+        Matrix.perspectiveM(videoProjM, 0, fovDeg.coerceIn(40f, 110f), (w / 2f) / h, 0.1f, 100f)
+        val cur: Mode = mode
+        if (cur == Mode.VIDEO && meshKey != projection.name) {
+            mesh = buildMesh(projection); meshKey = projection.name
+        }
+        // effective orientation in screen frame (identity at recenter)
+        synchronized(rawM) { computeEffLocked(rawM, effM) }
+        lastEffFwd = floatArrayOf(-effM[2], -effM[6], -effM[10])
+        lastEffUp = floatArrayOf(effM[1], effM[5], effM[9])
+        if (cur == Mode.BROWSER) updateGaze()
+        if (cur == Mode.VIDEO) updateMenu() else menuOpen = false
+        val swap = swapEyes
+        // Rotation-only UI: identical geometry in both eyes (no vergence
+        // conflict); per-eye convergence below centers the images.
+        // Stereo depth (eye shift) applies to video only.
+        for (vp in 0..1) {
+            val eye = if (swap) 1 - vp else vp
+            GLES20.glViewport(vp * w / 2, 0, w / 2, h)
+            // Convergence: shift each eye's image toward its half-center so
+            // the two centers land at the configured IPD apart. Baking the
+            // NDC offset into projEye[8] moves the image uniformly, at any
+            // depth (NDC shift o moves every pixel o*halfScreenPx).
+            // eye 0 (left half) shifts right (+), eye 1 shifts left (-).
+            System.arraycopy(projM, 0, projEyeM, 0, 16)
+            projEyeM[8] = if (eye == 0) -convShiftNdc else convShiftNdc
+            Matrix.multiplyMM(flatM, 0, projEyeM, 0, effM, 0)
+            // video uses the zoomed projection (same convergence shift)
+            System.arraycopy(videoProjM, 0, projEyeVM, 0, 16)
+            projEyeVM[8] = projEyeM[8]
+            if (cur == Mode.VIDEO && pinVideo) {
+                // pinned: screen fixed dead-ahead, only eye shift
+                Matrix.setIdentityM(viewM, 0)
+            } else {
+                System.arraycopy(effM, 0, viewM, 0, 16)
+            }
+            // eye-shifted view (parallel cameras)
+            Matrix.translateM(mvpM, 0, viewM, 0, if (eye == 0) eyeHalfM else -eyeHalfM, 0f, 0f)
+            Matrix.multiplyMM(tmpM, 0, projEyeVM, 0, mvpM, 0)
+            System.arraycopy(tmpM, 0, mvpM, 0, 16)
+            // Lens correction as a FINAL pass on a flat quad: the scene
+            // renders undistorted into the eye FBO (same aspect as the
+            // screen half, so all MVP math is unchanged), then the
+            // distortion quad resamples it with barrel UVs. Flat quad =
+            // no clipping boundary issues, unlike warping scene verts.
+            // The pointer draws after, in screen space, staying round.
+            val fw = w / 2 * FBO_SCALE; val fh = h * FBO_SCALE
+            // Physical eye-halves are ~0.8-1.4 aspect. Clamp: a bogus
+            // measurement must never reach the warp.
+            val eyeAspect = ((w / 2).toFloat() / h.toFloat()).coerceIn(0.5f, 2.0f)
+            val warpCx = if (vp == 0) -0.5f else 0.5f
+            ensureEyeFbo(fw, fh)
+            if (fboOk) {
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboId)
+                GLES20.glViewport(0, 0, fw, fh)
+                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+                if (cur == Mode.VIDEO) drawVideo(eye, warpCx, eyeAspect) else drawBrowser(warpCx, eyeAspect)
+                if (cur == Mode.VIDEO && menuOpen) drawMenuPanel(warpCx, eyeAspect)
+                // mipmaps for the distortion minification (smooth, not chunky)
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTexId)
+                GLES20.glGenerateMipmap(GLES20.GL_TEXTURE_2D)
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                GLES20.glViewport(vp * w / 2, 0, w / 2, h)
+                drawDistortionQuad(eyeAspect)
+            } else {
+                GLES20.glViewport(vp * w / 2, 0, w / 2, h)
+                if (cur == Mode.VIDEO) drawVideo(eye, warpCx, eyeAspect) else drawBrowser(warpCx, eyeAspect)
+                if (cur == Mode.VIDEO && menuOpen) drawMenuPanel(warpCx, eyeAspect)
+            }
+            // Menu lives in the browser's pipeline (FBO + flatM with
+            // convergence), so it fuses exactly like the browser panel.
+            // The pointer is then re-warped to the displayed position
+            // (see drawScreenPointer): seen and computed agree.
+            if (cur == Mode.VIDEO && menuOpen && menuStickyValid)
+                drawScreenPointer(menuStickyW[0], menuStickyW[1], menuStickyW[2], flatM, eyeAspect, menuDwellProg())
+            // screen-space pointer, re-warped to the displayed position:
+            // project the world hit with this eye's rotation-only matrix
+            if (cur == Mode.BROWSER && hitValid)
+                drawScreenPointer(hitX, hitY, -panelDistM, flatM, eyeAspect, browserDwellProg())
+        }
+    }
+
+    /** Scene-vertex warp stays OFF (it breaks clipping where the dome
+     *  crosses behind the camera); distortion runs per-pixel on the flat
+     *  final quad instead. */
+    private fun setWarp(
+        uOn: Int, uCx: Int, uK1: Int, uK2: Int, uAsp: Int, cx: Float, aspect: Float
+    ) {
+        GLES20.glUniform1f(uOn, 0f)
+    }
+
+    /** Dwell progress 0..1 for the browser pointer (full ring → point). */
+    private fun browserDwellProg(): Float = browProgF.coerceIn(0f, 1f)
+
+    /** Dwell progress 0..1 for the menu pointer. */
+    private fun menuDwellProg(): Float =
+        if (menuHighlight != -2) menuProg[menuSlot(menuHighlight)].coerceIn(0f, 1f) else 0f
+
+    private val clipV = FloatArray(4)
+
+    /** Pointer ring in screen space. The panels live behind the barrel
+     *  distortion, so the projected point is re-warped with the forward
+     *  lens model to land on the button as displayed. NOTE the center:
+     *  the distortion quad is a fullscreen (-1..1) quad drawn under a
+     *  HALF viewport, so its center is NDC (0,0) per eye — warping toward
+     *  the half-centers (±0.5) lands a quarter-screen off and doubles. */
+    private fun drawScreenPointer(
+        wx: Float, wy: Float, wz: Float, mat: FloatArray, aspect: Float, prog: Float
+    ) {
+        v4[0] = wx; v4[1] = wy; v4[2] = wz; v4[3] = 1f
+        Matrix.multiplyMV(clipV, 0, mat, 0, v4, 0)
+        val cw = clipV[3]
+        if (cw <= 0.01f) return
+        // work in distortion-quad texel units, mirroring FRAG_DIST exactly
+        val tu = clipV[0] / cw * 0.5f + 0.5f
+        val tv = clipV[1] / cw * 0.5f + 0.5f
+        val dx = (tu - 0.5f) * aspect
+        val dy = tv - 0.5f
+        val r2 = dx * dx + dy * dy
+        val s = 1f / (1f + lensK1 * r2 + lensK2 * r2 * r2)
+        var nx = (0.5f + dx * s / aspect) * 2f - 1f
+        var ny = (0.5f + dy * s) * 2f - 1f
+        if (nx < -1.2f || nx > 1.2f || ny < -1.2f || ny > 1.2f) return
+        val sx = 0.022f * (1f - 0.85f * prog)
+        val sy = sx * aspect
+        putQuad(ptrVerts, ptrTex, nx - sx, ny - sy, nx + sx, ny + sy)
+        GLES20.glUseProgram(prog2d)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, reticleTexId)
+        GLES20.glUniform1i(uTex2d, 0)
+        GLES20.glUniformMatrix4fv(uMvp2d, 1, false, identM, 0)
+        // screen-space pointer: warp stays off (ring must stay round)
+        GLES20.glUniform1f(uWarpOn2d, 0f)
+        GLES20.glEnableVertexAttribArray(aPos2d)
+        GLES20.glVertexAttribPointer(aPos2d, 3, GLES20.GL_FLOAT, false, 0, ptrVerts)
+        GLES20.glEnableVertexAttribArray(aTex2d)
+        GLES20.glVertexAttribPointer(aTex2d, 2, GLES20.GL_FLOAT, false, 0, ptrTex)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        GLES20.glDisableVertexAttribArray(aPos2d)
+        GLES20.glDisableVertexAttribArray(aTex2d)
+    }
+
+    // scratch buffers: zero per-frame allocation on the GL thread (direct
+    // ByteBuffer churn caused GC strobes that read as pointer flicker)
+    private val v4 = FloatArray(4)
+    private val ptrVerts: FloatBuffer = ByteBuffer.allocateDirect(12 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+    private val ptrTex: FloatBuffer = ByteBuffer.allocateDirect(8 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+    private fun putQuad(vb: FloatBuffer, tb: FloatBuffer, x0: Float, y0: Float, x1: Float, y1: Float) {
+        vb.clear()
+        vb.put(x0); vb.put(y1); vb.put(0f)
+        vb.put(x0); vb.put(y0); vb.put(0f)
+        vb.put(x1); vb.put(y1); vb.put(0f)
+        vb.put(x1); vb.put(y0); vb.put(0f)
+        vb.position(0)
+        tb.clear()
+        tb.put(0f); tb.put(0f)
+        tb.put(0f); tb.put(1f)
+        tb.put(1f); tb.put(0f)
+        tb.put(1f); tb.put(1f)
+        tb.position(0)
+    }
+
+    /** Fullscreen quad resampling the eye FBO with barrel UVs. Flat quad
+     *  at safe depth: no clipping-boundary issues by construction. */
+    private fun drawDistortionQuad(aspect: Float) {
+        GLES20.glUseProgram(progDist)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTexId)
+        GLES20.glUniform1i(uTexDist, 0)
+        GLES20.glUniform1f(uK1Dist, lensK1)
+        GLES20.glUniform1f(uK2Dist, lensK2)
+        GLES20.glUniform1f(uAspectDist, aspect)
+        GLES20.glUniformMatrix4fv(uMvpDist, 1, false, identM, 0)
+        val v = floatArrayOf(-1f, -1f, 0f, -1f, 1f, 0f, 1f, -1f, 0f, 1f, 1f, 0f)
+        val t = floatArrayOf(0f, 0f, 0f, 1f, 1f, 0f, 1f, 1f)
+        GLES20.glEnableVertexAttribArray(aPosDist)
+        GLES20.glVertexAttribPointer(aPosDist, 3, GLES20.GL_FLOAT, false, 0, fb(v))
+        GLES20.glEnableVertexAttribArray(aTexDist)
+        GLES20.glVertexAttribPointer(aTexDist, 2, GLES20.GL_FLOAT, false, 0, fb(t))
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        GLES20.glDisableVertexAttribArray(aPosDist)
+        GLES20.glDisableVertexAttribArray(aTexDist)
+    }
+
+    /** (Re)creates the eye FBO at half-screen size. Failure falls back to
+     *  direct rendering (fboOk=false), never a black screen. */
+    private fun ensureEyeFbo(fw: Int, fh: Int) {
+        if (fboOk && fw == fboW && fh == fboH && fboId != 0) return
+        if (fboId != 0) { GLES20.glDeleteFramebuffers(1, intArrayOf(fboId), 0); fboId = 0 }
+        if (fboTexId != 0) { GLES20.glDeleteTextures(1, intArrayOf(fboTexId), 0); fboTexId = 0 }
+        fboOk = false
+        if (fw < 8 || fh < 8) return
+        try {
+            val ta = IntArray(1)
+            GLES20.glGenTextures(1, ta, 0)
+            fboTexId = ta[0]
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTexId)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR_MIPMAP_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+            try {
+                // anisotropic filtering on the minified eye buffer (if present)
+                val exts = GLES20.glGetString(GLES20.GL_EXTENSIONS) ?: ""
+                if (exts.contains("GL_EXT_texture_filter_anisotropic")) {
+                    val maxA = IntArray(1)
+                    GLES20.glGetIntegerv(0x84FF, maxA, 0)
+                    GLES20.glTexParameterf(
+                        GLES20.GL_TEXTURE_2D, 0x84FE,
+                        minOf(8f, maxA[0].toFloat()).coerceAtLeast(1f)
+                    )
+                }
+            } catch (_: Throwable) {}
+            GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, fw, fh, 0,
+                GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null)
+            val fa = IntArray(1)
+            GLES20.glGenFramebuffers(1, fa, 0)
+            fboId = fa[0]
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboId)
+            GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0,
+                GLES20.GL_TEXTURE_2D, fboTexId, 0)
+            fboOk = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER) ==
+                GLES20.GL_FRAMEBUFFER_COMPLETE && GLES20.glGetError() == GLES20.GL_NO_ERROR
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+            if (fboOk) { fboW = fw; fboH = fh }
+        } catch (_: Throwable) {
+            fboOk = false
+            try { GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0) } catch (_: Throwable) {}
+        }
+    }
+
+    // ---------- gaze ----------
+    // Panel kept modest (~44° wide): a huge close panel swings wildly with
+    // head turns and keystones, which reads as "rotation".
+    private fun panelHalfW(): Float = panelDistM * 0.40f
+    private fun panelHalfH(): Float = panelHalfW() * 0.62f
+
+    // last ray↔panel hit in panel-world coords (for the at-depth cursor)
+    private var hitX = 0f
+    private var hitY = 0f
+    private var hitValid = false
+    // stillness gate state: dwell must NEVER fire while the head is moving,
+    // or slow test turns sweep the gaze across rows and trigger accidental
+    // navigation + recentering mid-turn (reads as rotation/pan glitches).
+    private val dwellPrevM = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
+    private var dwellPrevT = 0L
+    private var dwellPrevInit = false
+
+    private fun updateGaze() {
+        val rows = browserRows
+        if (rows.isEmpty()) { highlight = -1; hitValid = false; return }
+        if (now() < inputGraceUntil) { dwellStart = now(); return }
+        // Windowed stillness + leaky dwell (same as the play menu): jitter
+        // and row churn only dent progress instead of zeroing the timer.
+        val nowMs = now()
+        var still = true
+        synchronized(rawM) { still = browserStill.update(rawM, nowMs) }
+        val dtMs = (nowMs - browProgT).coerceIn(0L, 500L)
+        browProgT = nowMs
+        if (!still) browProgF = maxOf(0f, browProgF - dtMs / 600f)
+        // head-forward ray in world (panel is axis-aligned at z=-D).
+        // Uses the recentered orientation, so the reticle and the hover agree.
+        val hm = FloatArray(16)
+        synchronized(rawM) { computeEffLocked(rawM, hm) }
+        val fx = -hm[2]; val fy = -hm[6]; val fz = -hm[10]
+        if (fz < -0.05f) {
+            val d = panelDistM
+            val t = d / -fz
+            val hx = fx * t; val hy = fy * t
+            val hw = panelHalfW(); val hh = panelHalfH()
+            if (hx >= -hw && hx <= hw && hy >= -hh && hy <= hh) {
+                hitX = hx; hitY = hy; hitValid = true
+                val u = (hx + hw) / (2 * hw)
+                val v = (hh - hy) / (2 * hh)
+                val vi = ((v * TEX - ROWS_Y0) / ROW_H).toInt()
+                if (vi in 0 until VISIBLE_ROWS) {
+                    val idx = (scroll + vi).coerceIn(0, rows.size - 1)
+                    if (idx != highlight) {
+                        highlight = idx; dwellFiredFor = -2
+                        // small credit on row change (replaces the old
+                        // 150ms-style stability delay): keeps flips cheap
+                        browProgF = minOf(browProgF, 0.25f)
+                    }
+                    if (still) browProgF += dtMs / dwellMs.toFloat()
+                    else browProgF = maxOf(0f, browProgF - dtMs / 600f)
+                    if (still && highlight != dwellFiredFor && browProgF >= 1f) {
+                        dwellFiredFor = highlight
+                        browProgF = 0f
+                        // slider rows pass the gaze fraction (u across the
+                        // panel) so one dwell sets any value; plain rows null
+                        val frac = if (rows[idx].slideKey != null) u else null
+                        onBrowserActivate(highlight, frac)
+                        return
+                    }
+                    return
+                }
+            }
+        }
+        // not hovering the panel: hide cursor, drain progress (no zeroing)
+        hitValid = false
+        browProgF = maxOf(0f, browProgF - 16f / 600f)
+    }
+
+    private fun ensureVisible() {
+        if (highlight < scroll) scroll = highlight
+        else if (highlight >= scroll + VISIBLE_ROWS) scroll = highlight - VISIBLE_ROWS + 1
+        scroll = scroll.coerceIn(0, maxOf(0, browserRows.size - VISIBLE_ROWS))
+    }
+
+    private fun now() = System.currentTimeMillis()
+
+    // ---------- play menu ----------
+    // World-locked panel floating up (or down) in the recentered frame.
+    // Look up past menuAngleDeg to open, back down (8° hysteresis) to hide.
+    // The pointer stays hidden during video until the menu opens.
+    /** Windowed stillness gate: displacement over the trailing ~250ms.
+     *  Per-frame deltas are useless — game-RV jitter trips a per-frame
+     *  gate ~30×/s (see the menu motion-reset bursts in the log), so
+     *  dwell can only accumulate during lucky-still streaks. Over a
+     *  window, zero-mean noise cancels while real motion accumulates. */
+    private class MotionStillness(private val windowMs: Long, private val limitDeg: Float) {
+        private val refM = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
+        private var refT = 0L
+        private var init = false
+        private val tmpA = FloatArray(16)
+        private val tmpB = FloatArray(16)
+        /** Call on the GL thread with the live rotation matrix. */
+        fun update(raw: FloatArray, nowMs: Long): Boolean {
+            if (!init) {
+                System.arraycopy(raw, 0, refM, 0, 16)
+                refT = nowMs
+                init = true
+                return true
+            }
+            Matrix.transposeM(tmpA, 0, refM, 0)
+            Matrix.multiplyMM(tmpB, 0, tmpA, 0, raw, 0)
+            val tr = tmpB[0] + tmpB[5] + tmpB[10]
+            val ang = Math.toDegrees(
+                kotlin.math.acos(((tr - 1f) / 2f).toDouble().coerceIn(-1.0, 1.0))
+            ).toFloat()
+            if (nowMs - refT >= windowMs) {
+                System.arraycopy(raw, 0, refM, 0, 16)
+                refT = nowMs
+            }
+            return ang < limitDeg
+        }
+    }
+    private val menuStill = MotionStillness(250L, 4f)
+    private val browserStill = MotionStillness(250L, 2.5f)
+    // leaky dwell integrators: progress grows while still on target and
+    // drains slowly otherwise. Resets can never win against tremor or
+    // target churn — flicker only dents progress instead of zeroing it.
+    private val menuProg = FloatArray(12)
+    private var menuProgT = 0L
+    private var browProgF = 0f
+    private var browProgT = 0L
+    private fun menuSlot(id: Int) = if (id == -1) 11 else id
+    private fun menuUsable(id: Int) = id != -2
+
+    /** Effective open angle (always 30..85) and side derived from the sign. */
+    private fun menuOpenAngle(): Float = kotlin.math.abs(menuAngleDeg).coerceIn(30f, 85f)
+    private fun menuIsBelow(): Boolean = menuAngleDeg < 0f
+    /** Menu panel elevation: the whole panel floats above the open angle
+     *  (center = angle + 12°, half-height ~10°), so looking at any button
+     *  keeps you above the trigger. No hysteresis anywhere: open at/above
+     *  the angle, closed below it. */
+    private fun menuElevDeg(): Float =
+        ((menuOpenAngle() + 12f).coerceAtMost(85f)) * (if (menuIsBelow()) -1f else 1f)
+    private fun menuHalfW(): Float = panelDistM * 0.465f
+    private fun menuHalfH(): Float = menuHalfW() * 0.20f
+
+    // ---------- play menu ----------
+
+    private fun updateMenu() {
+        val fwd = lastEffFwd
+        // Trigger metric: head-TILT (angle of the head-up vector from
+        // vertical), NOT gaze elevation. asin(fwd.y) conflates yaw with
+        // pitch once the head is tilted back: yawing ±30° about the tilted
+        // neck axis swings gaze on a cone whose elevation falls ~20°
+        // (77°→57°), closing the menu exactly when reaching for the end
+        // buttons. Head-up is preserved by yaw (local-Y rotation) exactly,
+        // so tilt = atan2(up.z, up.y) is yaw-invariant: + = tipped back,
+        // - = tipped forward, roll reads ~0 (never opens).
+        val up = lastEffUp
+        val tilt = Math.toDegrees(kotlin.math.atan2(up[2].toDouble(), up[1].toDouble())).toFloat()
+        val ang = menuOpenAngle()
+        val below = menuIsBelow()
+        // Open exactly at the angle; close 25° lower. The band is load-
+        // bearing, not hysteresis-for-comfort: reaching the panel ends
+        // dips the tilt reading ~15-20° (head-yaw cone geometry), so an
+        // exact close threshold strobes the menu (and every dwell) while
+        // operating the end buttons. Opening is still exact at the angle.
+        // Closing additionally needs 400ms continuously below, killing
+        // sensor-noise flapping at the boundary.
+        val openAt = ang
+        val closeAt = (ang - 25f).coerceAtLeast(15f)
+        val above = if (!below) tilt >= (if (!menuOpen) openAt else closeAt)
+            else tilt <= -(if (!menuOpen) openAt else closeAt)
+        val isUp: Boolean
+        if (above) {
+            menuBelowSince = 0L
+            isUp = true
+        } else if (!menuOpen) {
+            menuBelowSince = 0L
+            isUp = false
+        } else {
+            if (menuBelowSince == 0L) menuBelowSince = now()
+            isUp = now() - menuBelowSince < 400
+        }
+        if (!isUp) {
+            menuOpen = false; menuHitValid = false; menuStickyValid = false
+            menuHighlight = -2; menuDwellFiredFor = -3
+            menuBelowSince = 0L
+            if (menuWasOpen) FileLog.i("DomeVR-menu", "menu close")
+            menuWasOpen = false
+            menuProgFresh = true
+            return
+        }
+        menuOpen = true
+        menuWasOpen = true
+        // fresh progress each open: stale banks must never insta-fire
+        if (menuProgFresh) {
+            menuProgFresh = false
+            for (i in menuProg.indices) menuProg[i] = 0f
+            menuProgT = now()
+        }
+        // Windowed stillness: displacement over 250ms, immune to the
+        // per-frame sensor jitter that trips instant gates ~30×/s.
+        val nowMs = now()
+        var still = true
+        synchronized(rawM) { still = menuStill.update(rawM, nowMs) }
+        // fixed world-locked panel (no yaw following): center straight up
+        // in the recentered frame, facing the viewer. The bar is 1.5x the
+        // button row: buttons live in the middle 2/3, blank 1/6 margins
+        // either side are dead zones (highlight -2, no fire).
+        val d = panelDistM
+        val el = Math.toRadians(menuElevDeg().toDouble()).toFloat()
+        val cx = 0f; val cy = (kotlin.math.sin(el) * d); val cz = (-kotlin.math.cos(el) * d)
+        // normal toward viewer
+        var nx = -cx; var ny = -cy; var nz = -cz
+        val nl = kotlin.math.sqrt(nx * nx + ny * ny + nz * nz).coerceAtLeast(1e-6f)
+        nx /= nl; ny /= nl; nz /= nl
+        val denom = fwd[0] * nx + fwd[1] * ny + fwd[2] * nz
+        if (denom < -0.05f) {
+            val t = (cx * nx + cy * ny + cz * nz) / denom
+            val hx = fwd[0] * t; val hy = fwd[1] * t; val hz = fwd[2] * t
+            // The pointer tracks the gaze freely on the panel plane — even
+            // above/below/outside the panel — so it never parks at an edge.
+            // Only highlight/fire are confined to the panel itself.
+            menuStickyValid = true
+            menuStickyW = floatArrayOf(hx, hy, hz)
+            // panel up-vector in world: up = n × right, right = (1,0,0)
+            val ux = 0f; val uy = nz; val uz = -ny
+            val ul = kotlin.math.sqrt(uy * uy + uz * uz).coerceAtLeast(1e-6f)
+            val alongUp = ((hx - cx) * ux + (hy - cy) * (uy / ul) + (hz - cz) * (uz / ul))
+            val mhw = menuHalfW(); val mhh = menuHalfH()
+            val u = ((hx - cx) + mhw) / (2 * mhw)
+            val v = (mhh - alongUp) / (2 * mhh)
+            if (u >= 0f && u <= 1f && v >= 0f && v <= 1f) {
+                menuHitValid = true
+                menuHitW = floatArrayOf(hx, hy, hz)
+                val ub = (u - 1f / 6f) / (2f / 3f)
+                val id = if (v > 0.68f) -1 else if (ub < 0f || ub > 1f) -2
+                    else (ub * MENU_BUTTONS).toInt().coerceIn(0, MENU_BUTTONS - 1)
+                // Leaky dwell: adopt immediately; progress grows while still
+                // on target and drains slowly otherwise. Churn and motion
+                // only dent progress instead of zeroing the timer.
+                if (id != menuHighlight) {
+                    menuHighlight = id; menuDwellFiredFor = -3
+                    // cap carried progress on adopt: churn can never bank
+                    // a full dwell, and stale slots can't insta-fire
+                    if (menuUsable(id)) menuProg[menuSlot(id)] = minOf(menuProg[menuSlot(id)], 0.3f)
+                    FileLog.i("DomeVR-menu", "dwell start: id=$id tilt=${tilt.toInt()}°")
+                }
+                val slot = menuSlot(id)
+                val dtMs = (nowMs - menuProgT).coerceIn(0L, 500L)
+                menuProgT = nowMs
+                for (i in menuProg.indices)
+                    if (i != slot) menuProg[i] = maxOf(0f, menuProg[i] - dtMs / 600f)
+                // -2 = blank margin: hover shows the pointer, never fires
+                if (still && menuUsable(id)) menuProg[slot] += dtMs / dwellMs.toFloat()
+                if (still && menuUsable(id) && menuProg[slot] >= 1f && menuHighlight != menuDwellFiredFor) {
+                    menuDwellFiredFor = menuHighlight
+                    menuProg[slot] = 0f
+                    FileLog.i("DomeVR-menu", "FIRE id=$id")
+                    if (id == -1) onMenuEvent(MenuEvent.Seek(u)) else onMenuEvent(MenuEvent.Press(id))
+                    return
+                }
+                return
+            }
+        }
+        // off-panel: log the transition once (menuHitValid still true from
+        // the last hitting frame), then clear highlight (progress per slot
+        // is kept and drains slowly, so brief leaves are forgiven)
+        if (menuHitValid)
+            FileLog.i("DomeVR-menu", "left panel (was id=$menuHighlight)")
+        menuHitValid = false
+        if (menuHighlight != -2) {
+            menuHighlight = -2; menuDwellFiredFor = -3
+        }
+    }
+
+    // ---------- drawing ----------
+    private fun drawVideo(eye: Int, warpCx: Float, aspect: Float) {
+        val m = mesh ?: return
+        GLES20.glUseProgram(progOes)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, videoTextureId)
+        GLES20.glUniform1i(uTexOes, 0)
+        GLES20.glUniform1i(uStereoOes, when (stereo) { Stereo.MONO -> 0; Stereo.SBS -> 1; Stereo.OU -> 2 })
+        GLES20.glUniform1i(uEyeOes, eye)
+        GLES20.glUniform1f(uZoomOes, zoom.coerceIn(0.3f, 2.5f))
+        GLES20.glUniformMatrix4fv(uMvpOes, 1, false, mvpM, 0)
+        setWarp(uWarpOnOes, uWarpCxOes, uWarpK1Oes, uWarpK2Oes, uWarpAspectOes, warpCx, aspect)
+        GLES20.glEnableVertexAttribArray(aPosOes)
+        GLES20.glVertexAttribPointer(aPosOes, 3, GLES20.GL_FLOAT, false, 0, m.verts)
+        GLES20.glEnableVertexAttribArray(aTexOes)
+        GLES20.glVertexAttribPointer(aTexOes, 2, GLES20.GL_FLOAT, false, 0, m.tex)
+        GLES20.glDrawElements(GLES20.GL_TRIANGLES, m.indexCount, GLES20.GL_UNSIGNED_SHORT, m.indices)
+        GLES20.glDisableVertexAttribArray(aPosOes)
+        GLES20.glDisableVertexAttribArray(aTexOes)
+    }
+
+    /** Bilinear grid over the quad (p00 top-left, p10 top-right, p01
+     *  bottom-left, p11 bottom-right). Per-vertex lens warp needs real
+     *  vertices across the surface — a 2-triangle quad warps wrong. */
+    private fun gridQuadP(
+        p00: FloatArray, p10: FloatArray, p01: FloatArray, p11: FloatArray,
+        nx: Int, ny: Int
+    ): Mesh {
+        val verts = FloatArray((nx + 1) * (ny + 1) * 3)
+        val texs = FloatArray((nx + 1) * (ny + 1) * 2)
+        var vi = 0; var ti = 0
+        for (iy in 0..ny) {
+            val v = iy.toFloat() / ny
+            for (ix in 0..nx) {
+                val u = ix.toFloat() / nx
+                for (k in 0..2) {
+                    val top = p00[k] + (p10[k] - p00[k]) * u
+                    val bot = p01[k] + (p11[k] - p01[k]) * u
+                    verts[vi++] = top + (bot - top) * v
+                }
+                texs[ti++] = u; texs[ti++] = v
+            }
+        }
+        val idx = mutableListOf<Short>()
+        for (iy in 0 until ny) for (ix in 0 until nx) {
+            val a = (iy * (nx + 1) + ix).toShort()
+            val b = (a + 1).toShort(); val c = ((iy + 1) * (nx + 1) + ix).toShort(); val d = (c + 1).toShort()
+            idx += listOf(a, c, b, b, c, d)
+        }
+        return Mesh(fb(verts), fb(texs), sb(idx.toShortArray()), idx.size)
+    }
+
+    private fun drawMesh2d(m: Mesh, texId: Int, mat: FloatArray, warpCx: Float, aspect: Float) {
+        GLES20.glUseProgram(prog2d)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId)
+        GLES20.glUniform1i(uTex2d, 0)
+        GLES20.glUniformMatrix4fv(uMvp2d, 1, false, mat, 0)
+        setWarp(uWarpOn2d, uWarpCx2d, uWarpK12d, uWarpK22d, uWarpAspect2d, warpCx, aspect)
+        GLES20.glEnableVertexAttribArray(aPos2d)
+        GLES20.glVertexAttribPointer(aPos2d, 3, GLES20.GL_FLOAT, false, 0, m.verts)
+        GLES20.glEnableVertexAttribArray(aTex2d)
+        GLES20.glVertexAttribPointer(aTex2d, 2, GLES20.GL_FLOAT, false, 0, m.tex)
+        GLES20.glDrawElements(GLES20.GL_TRIANGLES, m.indexCount, GLES20.GL_UNSIGNED_SHORT, m.indices)
+        GLES20.glDisableVertexAttribArray(aPos2d)
+        GLES20.glDisableVertexAttribArray(aTex2d)
+    }
+
+    private var browserGrid: Mesh? = null
+    private var browserGridD = -1f
+    private fun drawBrowser(warpCx: Float, aspect: Float) {
+        maybeUploadBrowser()
+        val d = panelDistM; val hw = panelHalfW(); val hh = panelHalfH()
+        // rotation-only UI matrix: identical in both eyes, always fuses.
+        // Grid cached: rebuilding it per frame churned direct buffers and
+        // strobed the whole scene through GC.
+        if (browserGrid == null || browserGridD != d) {
+            browserGrid = gridQuadP(
+                floatArrayOf(-hw, hh, -d), floatArrayOf(hw, hh, -d),
+                floatArrayOf(-hw, -hh, -d), floatArrayOf(hw, -hh, -d), 12, 8
+            )
+            browserGridD = d
+        }
+        drawMesh2d(browserGrid!!, browserTexId, flatM, warpCx, aspect)
+    }
+
+    private fun makeReticle(): Int {
+        val tex = IntArray(1)
+        GLES20.glGenTextures(1, tex, 0)
+        val bmp = Bitmap.createBitmap(96, 96, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+        // transparent background (needs BLEND enabled); small red ring that
+        // the draw code shrinks toward a point as dwell progresses
+        c.drawColor(Color.TRANSPARENT)
+        val p = Paint(Paint.ANTI_ALIAS_FLAG)
+        p.color = Color.RED; p.style = Paint.Style.STROKE; p.strokeWidth = 7f
+        c.drawCircle(48f, 48f, 30f, p)
+        p.style = Paint.Style.FILL
+        c.drawCircle(48f, 48f, 5f, p)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex[0])
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+        bmp.recycle()
+        return tex[0]
+    }
+
+    private fun maybeUploadBrowser() {
+        ensureVisible()
+        val rows = browserRows
+        val end = (scroll + VISIBLE_ROWS).coerceAtMost(rows.size)
+        var h = browserTitle.hashCode() * 31 + scroll
+        for (i in scroll until end) h = h * 31 + rows[i].label.hashCode() * 7 + rows[i].meta.hashCode()
+        h = h * 31 + highlight
+        if (h == lastPanelHash && browserBitmap != null) return
+        lastPanelHash = h
+        val bmp = Bitmap.createBitmap(TEX, TEX, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+        c.drawColor(Color.rgb(13, 20, 28))
+        val p = Paint(Paint.ANTI_ALIAS_FLAG)
+        p.color = Color.WHITE; p.textSize = 44f
+        c.drawText(browserTitle.take(40), 40f, 72f, p)
+        p.textSize = 26f; p.color = Color.rgb(125, 211, 252)
+        c.drawText("stare to select • tap = center view • vol keys = volume", 40f, 114f, p)
+        var y = ROWS_Y0
+        for (i in scroll until end) {
+            val r = rows[i]
+            if (i == highlight) {
+                p.color = Color.rgb(30, 58, 95)
+                c.drawRect(20f, y.toFloat(), 1004f, (y + ROW_H).toFloat(), p)
+            }
+            val icon = when (r.kind) {
+                BrowserRow.FOLDER -> "📁"
+                BrowserRow.VIDEO -> "🎬"
+                BrowserRow.ACTION -> "⚙"
+                else -> "📄"
+            }
+            p.color = Color.WHITE; p.textSize = 36f
+            c.drawText("$icon  ${r.label.take(30)}", 44f, (y + 34).toFloat(), p)
+            if (r.slideKey != null) {
+                // gaze slider: value text + full-width bar; dwelling at
+                // any horizontal position sets that value directly
+                val frac = ((r.slideVal - r.slideMin) / (r.slideMax - r.slideMin)).coerceIn(0f, 1f)
+                p.color = Color.rgb(125, 211, 252); p.textSize = 24f; p.textAlign = Paint.Align.RIGHT
+                c.drawText(r.meta.take(20), 1000f, (y + 30).toFloat(), p)
+                p.textAlign = Paint.Align.LEFT
+                p.color = Color.rgb(51, 65, 85)
+                c.drawRect(44f, (y + 40).toFloat(), 1000f, (y + 56).toFloat(), p)
+                p.color = Color.rgb(125, 211, 252)
+                c.drawRect(44f, (y + 40).toFloat(), 44f + 956f * frac, (y + 56).toFloat(), p)
+            } else if (r.meta.isNotEmpty()) {
+                p.color = Color.rgb(148, 163, 184); p.textSize = 24f
+                c.drawText("    ${r.meta.take(56)}", 44f, (y + 58).toFloat(), p)
+            }
+            y += ROW_H
+        }
+        if (rows.size > VISIBLE_ROWS) {
+            p.color = Color.rgb(125, 211, 252); p.textSize = 24f
+            c.drawText("… ${scroll + 1}-${end} of ${rows.size} (look up/down to scroll)", 44f, 1000f, p)
+        }
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, browserTexId)
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+        browserBitmap?.recycle()
+        browserBitmap = bmp
+    }
+
+    override fun onFrameAvailable(st: SurfaceTexture?) { frameAvailable = true; arrivedFrames++ }
+
+    // ---------- play menu drawing ----------
+    private var menuGrid: Mesh? = null
+    private var menuGridD = -1f
+    private var menuGridEl = -999f
+    private fun drawMenuPanel(warpCx: Float, aspect: Float) {
+        maybeUploadMenu()
+        // browser-pipeline panel (FBO + flatM with convergence): fuses
+        // exactly like the browser panel
+        val d = panelDistM
+        val el = Math.toRadians(menuElevDeg().toDouble()).toFloat()
+        if (menuGrid == null || menuGridD != d || menuGridEl != el) {
+            val cx = 0f; val cy = (kotlin.math.sin(el) * d); val cz = (-kotlin.math.cos(el) * d)
+            var nx = -cx; var ny = -cy; var nz = -cz
+            val nl = kotlin.math.sqrt(nx * nx + ny * ny + nz * nz).coerceAtLeast(1e-6f)
+            nx /= nl; ny /= nl; nz /= nl
+            // up = n × (1,0,0) = (0, nz, -ny)
+            val mhw = menuHalfW(); val mhh = menuHalfH()
+            val ux = 0f; val uy = nz; val uz = -ny
+            fun corner(sx: Float, sy: Float) = floatArrayOf(
+                cx + sx * mhw + ux * sy * mhh,
+                cy + uy * sy * mhh,
+                cz + uz * sy * mhh
+            )
+            menuGrid = gridQuadP(
+                corner(-1f, 1f), corner(1f, 1f), corner(-1f, -1f), corner(1f, -1f),
+                16, 6
+            )
+            menuGridD = d; menuGridEl = el
+        }
+        drawMesh2d(menuGrid!!, menuTexId, flatM, warpCx, aspect)
+    }
+
+    private fun maybeUploadMenu() {
+        val posSec = (menuPosMs / 1000).toInt()
+        val durSec = (menuDurMs / 1000).toInt()
+        val flashing = menuFlash.isNotEmpty() && now() < menuFlashUntil
+        val h = menuHighlight * 31 + posSec * 131 + durSec * 17 +
+            (if (menuPlaying) 1 else 0) + (if (flashing) 1009 else 0) + menuFlash.hashCode()
+        if (h == lastMenuHash && menuBitmap != null) return
+        lastMenuHash = h
+        val W = 1024; val H = 288
+        val bmp = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+        c.drawColor(Color.rgb(10, 14, 22))
+        val p = Paint(Paint.ANTI_ALIAS_FLAG)
+        val icons = arrayOf("⏮", "−10s", if (menuPlaying) "⏸" else "▶", "+10s", "⏭", "⚙", "🔊+", "🔊−", "Z−", "Z+", "📁")
+        val caps = arrayOf("prev", "rew", "play", "ff", "next", "settings", "vol+", "vol−", "zoom−", "zoom+", "files")
+        val bw = (W.toFloat() * 4f / 6f) / MENU_BUTTONS
+        val bx0 = W.toFloat() / 6f
+        for (i in 0 until MENU_BUTTONS) {
+            if (i == menuHighlight) {
+                p.color = Color.rgb(30, 58, 95)
+                c.drawRect(bx0 + i * bw + 4f, 8f, bx0 + (i + 1) * bw - 4f, 188f, p)
+            }
+            p.color = Color.WHITE; p.textSize = 32f; p.textAlign = Paint.Align.CENTER
+            c.drawText(icons[i], bx0 + i * bw + bw / 2f, 76f, p)
+            p.color = Color.rgb(148, 163, 184); p.textSize = 16f
+            c.drawText(caps[i], bx0 + i * bw + bw / 2f, 120f, p)
+        }
+        // progress bar (seek zone)
+        val frac = if (menuDurMs > 0) (menuPosMs.toFloat() / menuDurMs).coerceIn(0f, 1f) else 0f
+        p.color = Color.rgb(51, 65, 85)
+        c.drawRect(24f, 208f, (W - 24).toFloat(), 240f, p)
+        p.color = Color.rgb(125, 211, 252)
+        c.drawRect(24f, 208f, 24f + (W - 48) * frac, 240f, p)
+        if (menuHighlight == -1) {
+            p.color = Color.WHITE; p.style = Paint.Style.STROKE; p.strokeWidth = 4f
+            c.drawRect(24f, 208f, (W - 24).toFloat(), 240f, p)
+            p.style = Paint.Style.FILL
+        }
+        p.color = Color.WHITE; p.textSize = 16f; p.textAlign = Paint.Align.CENTER
+        c.drawText(if (flashing) menuFlash else "${fmtTime(menuPosMs)} / ${fmtTime(menuDurMs)}", W / 2f, 276f, p)
+        p.textAlign = Paint.Align.LEFT
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, menuTexId)
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+        menuBitmap?.recycle()
+        menuBitmap = bmp
+    }
+
+    private fun fmtTime(ms: Long): String {
+        val s = (ms / 1000).toInt().coerceAtLeast(0)
+        return "%d:%02d".format(s / 60, s % 60)
+    }
+
+    // ---- meshes ----
+    private data class Mesh(val verts: FloatBuffer, val tex: FloatBuffer, val indices: java.nio.ShortBuffer, val indexCount: Int)
+
+    private fun buildMesh(proj: Projection): Mesh {
+        return when (proj) {
+            Projection.FLAT -> gridQuadP(
+                floatArrayOf(-3.2f, 1.8f, -4f), floatArrayOf(3.2f, 1.8f, -4f),
+                floatArrayOf(-3.2f, -1.8f, -4f), floatArrayOf(3.2f, -1.8f, -4f),
+                24, 12
+            )
+            Projection.FISHEYE -> sphereSegment(180f, flipX = true)
+            Projection.DEG180 -> sphereSegment(180f)
+            Projection.DEG220 -> sphereSegment(220f)
+            Projection.DEG270 -> sphereSegment(270f)
+            Projection.DEG360 -> sphereSegment(360f)
+        }
+    }
+
+    private fun sphereSegment(deg: Float, flipX: Boolean = false): Mesh {
+        val rows = 24; val cols = 48
+        val r = 8f
+        val yawMax = Math.toRadians((deg / 2).toDouble())
+        val verts = mutableListOf<Float>(); val texs = mutableListOf<Float>()
+        for (iy in 0..rows) {
+            val v = iy.toFloat() / rows
+            val pitch = Math.PI * (v - 0.42)
+            for (ix in 0..cols) {
+                val u = ix.toFloat() / cols
+                val yaw = -yawMax + u * 2 * yawMax
+                val x = (r * Math.cos(pitch) * Math.sin(yaw)).toFloat()
+                val y = (r * Math.sin(pitch)).toFloat()
+                val z = (-r * Math.cos(pitch) * Math.cos(yaw)).toFloat()
+                verts += listOf(x, y, z)
+                texs += listOf(if (flipX) 1f - u else u, 1f - v)
+            }
+        }
+        val idx = mutableListOf<Short>()
+        for (iy in 0 until rows) for (ix in 0 until cols) {
+            val a = (iy * (cols + 1) + ix).toShort()
+            val b = (a + 1).toShort(); val cc = ((iy + 1) * (cols + 1) + ix).toShort(); val d = (cc + 1).toShort()
+            idx += listOf(a, cc, b, b, cc, d)
+        }
+        return Mesh(fb(verts.toFloatArray()), fb(texs.toFloatArray()), sb(idx.toShortArray()), idx.size)
+    }
+
+    private fun fb(a: FloatArray): FloatBuffer =
+        ByteBuffer.allocateDirect(a.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply { put(a); position(0) }
+    private fun sb(a: ShortArray): java.nio.ShortBuffer =
+        ByteBuffer.allocateDirect(a.size * 2).order(ByteOrder.nativeOrder()).asShortBuffer().apply { put(a); position(0) }
+
+    private fun buildProgram(vs: String, fs: String): Int {
+        fun compile(type: Int, src: String, tag: String): Int {
+            val s = GLES20.glCreateShader(type)
+            GLES20.glShaderSource(s, src)
+            GLES20.glCompileShader(s)
+            val ok = IntArray(1)
+            GLES20.glGetShaderiv(s, GLES20.GL_COMPILE_STATUS, ok, 0)
+            if (ok[0] == 0) {
+                val log = GLES20.glGetShaderInfoLog(s) ?: "?"
+                android.util.Log.e("DomeVR-GL", "$tag compile FAILED: $log")
+                try { FileLog.e("DomeVR-GL", "$tag compile FAILED: $log") } catch (_: Throwable) {}
+            }
+            return s
+        }
+        val v = compile(GLES20.GL_VERTEX_SHADER, vs, "VERT")
+        val f = compile(GLES20.GL_FRAGMENT_SHADER, fs, "FRAG")
+        return GLES20.glCreateProgram().also {
+            GLES20.glAttachShader(it, v); GLES20.glAttachShader(it, f); GLES20.glLinkProgram(it)
+            val ok = IntArray(1)
+            GLES20.glGetProgramiv(it, GLES20.GL_LINK_STATUS, ok, 0)
+            if (ok[0] == 0) {
+                val log = GLES20.glGetProgramInfoLog(it) ?: "?"
+                android.util.Log.e("DomeVR-GL", "link FAILED: $log")
+                try { FileLog.e("DomeVR-GL", "link FAILED: $log") } catch (_: Throwable) {}
+            }
+            GLES20.glDeleteShader(v); GLES20.glDeleteShader(f)
+        }
+    }
+}

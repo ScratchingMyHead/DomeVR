@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:background="#000" android:keepScreenOn="true">
+    <android.opengl.GLSurfaceView
+        android:id="@+id/glView"
+        android:layout_width="match_parent" android:layout_height="match_parent" />
+    <LinearLayout
+        android:orientation="horizontal"
+        android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:background="#99000000" android:padding="8dp">
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnClose" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:text="Exit" style="@style/Widget.Material3.Button.TextButton" />
+        <TextView android:id="@+id/txtStatus"
+            android:layout_width="0dp" android:layout_weight="1" android:layout_height="wrap_content"
+            android:text="DomeVR" android:textColor="#fff" android:paddingStart="8dp"
+            android:singleLine="true" android:ellipsize="middle" />
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnMode" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:text="Mode" style="@style/Widget.Material3.Button.TextButton" />
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnBrowser" android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:text="Files" style="@style/Widget.Material3.Button.TextButton" />
+    </LinearLayout>
+</FrameLayout>

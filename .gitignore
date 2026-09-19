@@ -1,0 +1,15 @@
+# Gradle / Android build outputs
+.gradle/
+build/
+app/build/
+*/build/
+local.properties
+*.iml
+.idea/
+.DS_Store
+# Signing keystores never belong in git
+*.jks
+*.keystore
+# Captured logs / traces
+*.log
+*.hprof
