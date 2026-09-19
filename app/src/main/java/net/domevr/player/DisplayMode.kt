@@ -1,3 +1,6 @@
+/* DomeVR Player — GPL-3.0-only.
+ * See LICENSE in the repository root.
+ */
 package net.domevr.player
 
 enum class Projection(val label: String, val degrees: Float) {
