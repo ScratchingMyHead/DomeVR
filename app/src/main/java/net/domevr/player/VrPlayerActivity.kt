@@ -29,6 +29,7 @@ import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.source.LoadEventInfo
 import androidx.media3.exoplayer.source.MediaLoadData
 import java.io.IOException
+import org.json.JSONObject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -67,6 +68,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         data class Smb(val connId: String, val path: String) : Loc
         data class Local(val dir: File) : Loc
         data object SettingsPage : Loc
+        data object ShapingPage : Loc
         data object Sensors : Loc
     }
     private var loc: Loc = Loc.Root
@@ -79,8 +81,130 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         val smb: SmbEntry? = null, val local: File? = null,
         val action: String? = null, // for settings rows
         val slideKey: String? = null, // gaze slider id (settings rows)
-        val slideMin: Float = 0f, val slideMax: Float = 1f, val slideVal: Float = 0f
+        val slideMin: Float = 0f, val slideMax: Float = 1f, val slideVal: Float = 0f,
+        val segLabels: List<String> = emptyList(), // segmented button row labels
+        val segActions: List<String> = emptyList(), // one action per segment
+        val segSelected: Int = -1, // currently active segment
+        val previewMags: FloatArray? = null, // shaping preview: per-point magnitude 0..1
+        val previewHull: IntArray? = null, // shaping preview: convex-hull point indices
+        val previewN: Int = 9, // shaping preview grid size (n x n)
+        val previewPos: FloatArray? = null // shaping preview: absolute [x,y] per point, [0,1], y down
     )
+
+    /** Absolute preview positions from offsets: nominal + offset, y down. */
+    private fun previewPos(ox: FloatArray, oy: FloatArray, n: Int): FloatArray {
+        val pos = FloatArray(ox.size * 2)
+        for (j in ox.indices) {
+            pos[j * 2] = (j % n).toFloat() / (n - 1) + ox[j]
+            pos[j * 2 + 1] = (j / n).toFloat() / (n - 1) + oy[j]
+        }
+        return pos
+    }
+
+    /** Authored warp shape from shaping/shapes.json: 9x9 absolute (u,v) grid,
+     *  row-major, row 0 = top, v top->bottom. Converted to offsets at load
+     *  (offset = point - nominal) in half-frame normalized units. */
+    private data class UiShape(
+        val id: String,
+        val label: String,
+        val n: Int,
+        val ox: FloatArray, // x offsets, +right
+        val oy: FloatArray, // y offsets, +down (grid space)
+        val mags: FloatArray, // per-point magnitude normalized 0..1 by file max
+        val maxMag: Float,
+        val hull: IntArray // convex-hull indices over moved points
+    )
+    private var shapingShapes: List<UiShape> = emptyList()
+    private var lastShapingKey = "\u0000"
+
+    private fun slugShapeId(name: String): String {
+        val s = name.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-')
+        return s.ifEmpty { "shape" }
+    }
+
+    /** Load shaping grids from APK assets (copied from misc/shapes.json at build).
+     *  Bad files/points are skipped with a log; never throws. */
+    private fun loadShapingShapes() {
+        try {
+            val raw = assets.open("shaping/shapes.json").bufferedReader().use { it.readText() }
+            val arr = JSONObject(raw).getJSONArray("shapes")
+            val out = mutableListOf<UiShape>()
+            val used = mutableSetOf<String>()
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                val name = o.optString("name", "shape ${i + 1}")
+                var id = slugShapeId(name)
+                var k = 2
+                while (id in used) { id = "${slugShapeId(name)}-$k"; k++ }
+                used += id
+                val g = o.getJSONArray("grid")
+                val count = g.length()
+                val n = kotlin.math.sqrt(count.toDouble()).toInt()
+                if (n < 2 || n * n != count) { Log.w(TAG, "shaping: $name bad grid size $count"); continue }
+                val ox = FloatArray(count); val oy = FloatArray(count)
+                var ok = true
+                for (j in 0 until count) {
+                    val pt = g.getJSONArray(j)
+                    val x = pt.optDouble(0, Double.NaN); val y = pt.optDouble(1, Double.NaN)
+                    if (x.isNaN() || y.isNaN()) { ok = false; break }
+                    ox[j] = (x - (j % n).toDouble() / (n - 1)).toFloat().coerceIn(-1f, 1f)
+                    oy[j] = (y - (j / n).toDouble() / (n - 1)).toFloat().coerceIn(-1f, 1f)
+                }
+                if (!ok) { Log.w(TAG, "shaping: $name bad point"); continue }
+                var maxMag = 0f
+                val mags = FloatArray(count)
+                for (j in 0 until count) {
+                    val m = kotlin.math.hypot(ox[j], oy[j])
+                    mags[j] = m; if (m > maxMag) maxMag = m
+                }
+                val norm = if (maxMag > 1e-9f) FloatArray(count) { mags[it] / maxMag } else FloatArray(count)
+                out += UiShape(id, name, n, ox, oy, norm, maxMag, convexHull(ox, oy, mags, n))
+            }
+            shapingShapes = out
+            Log.i(TAG, "shaping: loaded ${out.size} shapes")
+        } catch (t: Throwable) {
+            Log.e(TAG, "shaping load failed", t)
+            shapingShapes = emptyList()
+        }
+    }
+
+    /** Minimum convex polygon (Andrew monotone chain) over moved points,
+     *  in nominal grid coords + offset (display positions). Returns grid indices. */
+    private fun convexHull(ox: FloatArray, oy: FloatArray, mags: FloatArray, n: Int): IntArray {
+        data class P(val x: Double, val y: Double, val idx: Int)
+        val pts = mutableListOf<P>()
+        for (j in ox.indices) {
+            if (mags[j] <= 1e-6f) continue
+            pts += P((j % n).toDouble() / (n - 1) + ox[j], (j / n).toDouble() / (n - 1) + oy[j], j)
+        }
+        if (pts.size < 3) return pts.map { it.idx }.toIntArray()
+        val s = pts.sortedWith(compareBy({ it.x }, { it.y }))
+        fun cross(o: P, a: P, b: P) = (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+        val lower = mutableListOf<P>()
+        for (p in s) { while (lower.size >= 2 && cross(lower[lower.size - 2], lower.last(), p) <= 0) lower.removeLast(); lower += p }
+        val upper = mutableListOf<P>()
+        for (p in s.reversed()) { while (upper.size >= 2 && cross(upper[upper.size - 2], upper.last(), p) <= 0) upper.removeLast(); upper += p }
+        lower.removeLast(); upper.removeLast()
+        return (lower + upper).map { it.idx }.toIntArray()
+    }
+
+    /** Normalized weighted average of enabled shapes (null = identity).
+     *  Averages offsets in grid space; weights are 0..1. */
+    private fun averagedShapeOffsets(): Triple<FloatArray, FloatArray, Int>? {
+        val active = shapingShapes.filter { settings.shapeEnabled(it.id) }
+        if (active.isEmpty()) return null
+        val n = active[0].n
+        val same = active.filter { it.n == n }
+        var wsum = 0f
+        for (s in same) wsum += settings.shapeWeight(s.id) / 100f
+        if (wsum <= 0f) return null
+        val ex = FloatArray(n * n); val ey = FloatArray(n * n)
+        for (s in same) {
+            val w = settings.shapeWeight(s.id) / 100f / wsum
+            for (j in ex.indices) { ex[j] += w * s.ox[j]; ey[j] += w * s.oy[j] }
+        }
+        return Triple(ex, ey, n)
+    }
 
     private var connId: String = ""
     private var playUrl: String? = null
@@ -192,6 +316,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         setContentView(R.layout.activity_vr)
         settings = SettingsStore(this)
         connections = ConnectionStore(this).load()
+        loadShapingShapes()
 
         glView = findViewById(R.id.glView)
         txtStatus = findViewById(R.id.txtStatus)
@@ -286,6 +411,18 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         renderer.panelDistM = settings.panelDistM
         renderer.dwellMs = settings.dwellMs
         renderer.pinVideo = settings.pinVideo
+        renderer.domeStretchK = settings.domeStretchK
+        renderer.domeOnset = settings.domeOnset
+        // Shaping grids: feed active set only when content changed (mesh rebuild is keyed).
+        val skey = shapingShapes.filter { settings.shapeEnabled(it.id) }
+            .joinToString(";") { "${it.id}:${settings.shapeWeight(it.id)}" }
+        if (skey != lastShapingKey) {
+            lastShapingKey = skey
+            renderer.shapingActive = shapingShapes.filter { settings.shapeEnabled(it.id) }.map {
+                VrRenderer.ActiveShape(it.ox, it.oy, settings.shapeWeight(it.id) / 100f, it.n)
+            }
+            renderer.shapingRevision++
+        }
         renderer.testSweep = settings.testSweep
         renderer.lensK1 = settings.lensK1
         renderer.lensK2 = settings.lensK2
@@ -510,7 +647,8 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
     private fun enterBrowser() {
         player?.pause()
         renderer.mode = VrRenderer.Mode.BROWSER
-        renderer.resetBasis("files") // panel appears straight ahead
+        // No recenter: the world (video + panel frame) must not move when
+        // opening a menu. The panel stays world-locked; look around for it.
         refresh()
     }
 
@@ -520,6 +658,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             is Loc.Smb -> showSmb(l.connId, l.path)
             is Loc.Local -> showLocal(l.dir)
             is Loc.SettingsPage -> showSettings()
+            is Loc.ShapingPage -> showShaping()
             is Loc.Sensors -> showSensors()
         }
     }
@@ -528,7 +667,9 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         rows = r
         renderer.browserTitle = title
         renderer.browserRows = r.map {
-            VrRenderer.BrowserRow(it.label, it.meta, it.kind, it.slideKey, it.slideMin, it.slideMax, it.slideVal)
+            VrRenderer.BrowserRow(it.label, it.meta, it.kind, it.slideKey, it.slideMin, it.slideMax, it.slideVal,
+                it.segLabels, it.segActions, it.segSelected,
+                it.previewMags, it.previewHull, it.previewN, it.previewPos)
         }
         txtStatus.text = status
     }
@@ -541,6 +682,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         }
         r += Row("This device", "phone storage", VrRenderer.BrowserRow.FOLDER, action = "local:")
         r += Row("Settings", currentOpticsSummary(), VrRenderer.BrowserRow.ACTION, action = "settings:")
+        r += Row("Shaping", "warp grids (dome correction)", VrRenderer.BrowserRow.ACTION, action = "shaping:")
         r += Row("Sensor debug", "live raw values", VrRenderer.BrowserRow.ACTION, action = "sensors:")
         pushRows("DomeVR", if (connections.isEmpty()) "Add a server in the 2D app, or open This device" else "${connections.size} servers — stare to open", r)
     }
@@ -603,26 +745,27 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun showSettings() {
-        fun on(cur: Boolean) = if (cur) "● on" else ""
         // gaze sliders: dwell anywhere on the bar to jump straight there
         fun slide(label: String, value: String, key: String, min: Float, max: Float, cur: Float) =
             Row(label, value, VrRenderer.BrowserRow.ACTION,
                 action = "slide:$key", slideKey = key, slideMin = min, slideMax = max, slideVal = cur)
         val r = mutableListOf(
-            Row(".. (back)", if (settingsFromVideo) "resume video" else "back to servers",
-                VrRenderer.BrowserRow.FOLDER, action = "settingsback:"),
-            Row("Video: 2D", on(renderer.stereo == Stereo.MONO), VrRenderer.BrowserRow.ACTION, action = "setstereo2:MONO"),
-            Row("Video: SBS", on(renderer.stereo == Stereo.SBS), VrRenderer.BrowserRow.ACTION, action = "setstereo2:SBS"),
-            Row("Video: OU (top/bottom)", on(renderer.stereo == Stereo.OU), VrRenderer.BrowserRow.ACTION, action = "setstereo2:OU"),
-            Row("Screen: Flat", on(renderer.projection == Projection.FLAT), VrRenderer.BrowserRow.ACTION, action = "setscreen:FLAT"),
-            Row("Screen: Pano 180", on(renderer.projection == Projection.DEG180), VrRenderer.BrowserRow.ACTION, action = "setscreen:DEG180"),
-            Row("Screen: Pano 220", on(renderer.projection == Projection.DEG220), VrRenderer.BrowserRow.ACTION, action = "setscreen:DEG220"),
-            Row("Screen: Pano 270", on(renderer.projection == Projection.DEG270), VrRenderer.BrowserRow.ACTION, action = "setscreen:DEG270"),
-            Row("Screen: Pano 360", on(renderer.projection == Projection.DEG360), VrRenderer.BrowserRow.ACTION, action = "setscreen:DEG360"),
-            Row("Lens: Normal", on(renderer.projection != Projection.FISHEYE), VrRenderer.BrowserRow.ACTION, action = "setlens:normal"),
-            Row("Lens: Fisheye", on(renderer.projection == Projection.FISHEYE), VrRenderer.BrowserRow.ACTION, action = "setlens:fisheye"),
+            Row("Video", renderer.stereo.label, VrRenderer.BrowserRow.ACTION,
+                segLabels = listOf("2D", "SBS", "OU"),
+                segActions = listOf("setstereo2:MONO", "setstereo2:SBS", "setstereo2:OU"),
+                segSelected = when (renderer.stereo) { Stereo.MONO -> 0; Stereo.SBS -> 1; Stereo.OU -> 2 }),
+            Row("Screen", renderer.projection.label, VrRenderer.BrowserRow.ACTION,
+                segLabels = listOf("Flat", "180", "220", "270", "360"),
+                segActions = listOf("setscreen:FLAT", "setscreen:DEG180", "setscreen:DEG220", "setscreen:DEG270", "setscreen:DEG360"),
+                segSelected = when (renderer.projection) { Projection.FLAT -> 0; Projection.DEG180 -> 1; Projection.DEG220 -> 2; Projection.DEG270 -> 3; Projection.DEG360 -> 4; else -> -1 }),
+            Row("Lens", if (renderer.projection == Projection.FISHEYE) "Fisheye" else "Normal", VrRenderer.BrowserRow.ACTION,
+                segLabels = listOf("Normal", "Fisheye"),
+                segActions = listOf("setlens:normal", "setlens:fisheye"),
+                segSelected = if (renderer.projection == Projection.FISHEYE) 1 else 0),
             slide("Field of view", "${settings.fovDeg.toInt()}°", "fov", 40f, 110f, settings.fovDeg),
             slide("Video size", "${String.format("%.2f", settings.videoZoom)}×", "zoom", 0.3f, 2.5f, settings.videoZoom),
+            slide("Dome stretch onset", "${((0.5f - settings.domeOnset) * 100).toInt()}% from edge", "domeOnset", 0f, 0.45f, settings.domeOnset),
+            slide("Dome stretch strength", "${(settings.domeStretchK * 100).toInt()}%", "domeStretch", 0f, 3f, settings.domeStretchK),
             slide("Eye separation", "${settings.ipdMm.toInt()} mm", "ipd", 40f, 80f, settings.ipdMm),
             slide("Panel distance", "${String.format("%.1f", settings.panelDistM)} m", "panel", 1.2f, 5f, settings.panelDistM),
             slide("Gaze delay", "${settings.dwellMs} ms", "dwell", 400f, 4000f, settings.dwellMs.toFloat()),
@@ -631,6 +774,40 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 VrRenderer.BrowserRow.ACTION, action = "set:pin"),
         )
         pushRows("Video settings", "stare at a bar position to jump there", r)
+    }
+
+    private fun showShaping() {
+        fun slide(label: String, value: String, key: String, min: Float, max: Float, cur: Float) =
+            Row(label, value, VrRenderer.BrowserRow.ACTION,
+                action = "slide:$key", slideKey = key, slideMin = min, slideMax = max, slideVal = cur)
+        val r = mutableListOf<Row>()
+        // Combined preview of the averaged transform (first row, not actionable).
+        val avg = averagedShapeOffsets()
+        if (avg != null) {
+            val (ex, ey, n) = avg
+            var mmax = 0f
+            val mags = FloatArray(ex.size)
+            for (j in ex.indices) {
+                val m = kotlin.math.hypot(ex[j], ey[j])
+                mags[j] = m; if (m > mmax) mmax = m
+            }
+            val norm = if (mmax > 1e-9f) FloatArray(ex.size) { mags[it] / mmax } else FloatArray(ex.size)
+            r += Row("Combined", "averaged transform", VrRenderer.BrowserRow.FILE,
+                previewMags = norm, previewHull = convexHull(ex, ey, mags, n), previewN = n,
+                previewPos = previewPos(ex, ey, n))
+        } else {
+            r += Row("Combined", "nothing enabled — identity", VrRenderer.BrowserRow.FILE)
+        }
+        for (s in shapingShapes) {
+            val on = settings.shapeEnabled(s.id)
+            val w = settings.shapeWeight(s.id)
+            r += Row(s.label, if (on) "ON • ${w.toInt()}%" else "off",
+                VrRenderer.BrowserRow.ACTION, action = "toggleshape:${s.id}",
+                previewMags = s.mags, previewHull = s.hull, previewN = s.n,
+                previewPos = previewPos(s.ox, s.oy, s.n))
+            r += slide("${s.label} weight", "${w.toInt()}%", "shapeWeight-${s.id}", 0f, 100f, w)
+        }
+        pushRows("Shaping", "dwell a shape to toggle • dwell a bar to set weight", r)
     }
 
     /** Live raw sensor readout. Fixed row count; navigation is frozen here
@@ -699,9 +876,8 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 "max rate per axis since page opened", VrRenderer.BrowserRow.ACTION),
             Row("PEAK gaze ${String.format("%.0f", peakGazeDeg)}° $peakGazeDir",
                 "max image deflection since page opened", VrRenderer.BrowserRow.ACTION),
-            Row(".. (back)", "leave debug page", VrRenderer.BrowserRow.FOLDER, action = "up:")
         )
-        pushRows("Sensors — turn head L/R", "nav frozen here • Back exits", r)
+        pushRows("Sensors — turn head L/R", "nav frozen here • X exits", r)
     }
 
     private fun logSensors() {
@@ -718,14 +894,36 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
 
     private fun Float.fmt(): String = String.format("%.2f", this)
 
+    /** X close button (title bar): resume video if one exists, else server list.
+     *  Never recenters: closing must not move the world. */
+    private fun closeOverlay() {
+        if (player != null) {
+            settingsFromVideo = false
+            renderer.mode = VrRenderer.Mode.VIDEO
+        } else {
+            settingsFromVideo = false
+            loc = Loc.Root
+            refresh()
+        }
+    }
+
     private fun activateRow(idx: Int, frac: Float? = null) {
+        if (idx == -10) { if (renderer.mode == VrRenderer.Mode.BROWSER) closeOverlay(); return }
         if (idx !in rows.indices || renderer.mode != VrRenderer.Mode.BROWSER) return
-        // Debug page: frozen except Back (up:), so staring at numbers is safe.
+        // Debug page: frozen except X, so staring at numbers is safe.
         if (loc == Loc.Sensors) {
             if (rows[idx].action == "up:") handleAction("up:")
             return
         }
         val row = rows[idx]
+        // segmented button row: horizontal gaze fraction picks the segment
+        if (row.segActions.isNotEmpty()) {
+            if (frac == null) return // DPAD tap carries no position; gaze only
+            // frac spans the full panel; buttons span x 20..1004 of TEX 1024
+            val fx = ((frac * 1024f - 20f) / 984f).coerceIn(0f, 0.999f)
+            val seg = (fx * row.segActions.size).toInt().coerceIn(0, row.segActions.size - 1)
+            handleAction(row.segActions[seg]); return
+        }
         // gaze slider: one dwell at fraction u sets the value directly
         if (row.slideKey != null && frac != null) {
             handleSlide(row.slideKey, frac)
@@ -756,7 +954,17 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             "zoom" -> settings.videoZoom = ((0.3f + f * 2.2f) * 20f).roundToInt() / 20f
             "ipd" -> settings.ipdMm = (40f + f * 40f).roundToInt().toFloat().coerceIn(40f, 80f)
             "panel" -> settings.panelDistM = ((1.2f + f * 3.8f) * 10f).roundToInt() / 10f
+            "domeOnset" -> settings.domeOnset = ((f * 0.45f) * 100f).roundToInt() / 100f
+            "domeStretch" -> settings.domeStretchK = ((f * 3f) * 20f).roundToInt() / 20f
             "dwell" -> settings.dwellMs = ((400f + f * 3600f) / 100f).roundToInt() * 100L
+            else -> {
+                // per-shape weight sliders: slideKey "shapeWeight-<slug>"
+                if (key.startsWith("shapeWeight-")) {
+                    val id = key.removePrefix("shapeWeight-")
+                    if (shapingShapes.any { it.id == id })
+                        settings.setShapeWeight(id, (f * 100f).roundToInt().toFloat().coerceIn(0f, 100f))
+                }
+            }
         }
         applyOptics(); refresh()
     }
@@ -775,13 +983,30 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 refresh()
             }
             act == "settings:" -> { settingsFromVideo = false; loc = Loc.SettingsPage; refresh() }
+            act == "shaping:" -> { settingsFromVideo = false; loc = Loc.ShapingPage; refresh() }
+            act == "shapingback:" -> {
+                if (settingsFromVideo && player != null) {
+                    settingsFromVideo = false
+                    renderer.mode = VrRenderer.Mode.VIDEO
+                } else {
+                    settingsFromVideo = false
+                    loc = Loc.Root
+                    refresh()
+                }
+            }
+            act.startsWith("toggleshape:") -> {
+                val id = act.removePrefix("toggleshape:")
+                if (shapingShapes.any { it.id == id }) {
+                    settings.setShapeEnabled(id, !settings.shapeEnabled(id))
+                    applyOptics(); refresh()
+                }
+            }
             act == "settingsback:" -> {
                 // Back out of settings: resume the video if we came from it,
                 // otherwise behave like going up to the server list.
                 if (settingsFromVideo && player != null) {
                     settingsFromVideo = false
                     renderer.mode = VrRenderer.Mode.VIDEO
-                    renderer.resetBasis("video")
                 } else {
                     settingsFromVideo = false
                     loc = Loc.Root
@@ -826,8 +1051,17 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                     "fov" -> settings.fovDeg = (settings.fovDeg + dir * 2f).coerceIn(40f, 110f)
                     "ipd" -> settings.ipdMm = (settings.ipdMm + dir * 1f).coerceIn(40f, 80f)
                     "zoom" -> settings.videoZoom = (settings.videoZoom + dir * 0.1f).coerceIn(0.3f, 2.5f)
+                    "domeOnset" -> settings.domeOnset = (settings.domeOnset + dir * 0.02f).coerceIn(0f, 0.45f)
+                    "domeStretch" -> settings.domeStretchK = (settings.domeStretchK + dir * 0.1f).coerceIn(0f, 3f)
                     "panel" -> settings.panelDistM = (settings.panelDistM + dir * 0.2f).coerceIn(1.2f, 5f)
                     "dwell" -> settings.dwellMs = (settings.dwellMs + dir * 250).coerceIn(400L, 4000L)
+                    else -> {
+                        if (key.startsWith("shapeWeight-")) {
+                            val id = key.removePrefix("shapeWeight-")
+                            if (shapingShapes.any { it.id == id })
+                                settings.setShapeWeight(id, (settings.shapeWeight(id) + dir * 5f).coerceIn(0f, 100f))
+                        }
+                    }
                 }
                 applyOptics(); refresh()
             }
@@ -934,24 +1168,30 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 5 -> {
                     // 3D settings page over the video (player keeps running,
                     // so zoom/FOV/type changes preview live on return).
-                    // Backing out resumes the video in place.
+                    // No recenter: opening must not move the world.
                     settingsFromVideo = true
                     loc = Loc.SettingsPage
                     renderer.mode = VrRenderer.Mode.BROWSER
-                    renderer.resetBasis("settings")
                     refresh()
                 }
-                6 -> audioManager().adjustStreamVolume(
+                6 -> {
+                    // 3D shaping page over the video (same resume behaviour).
+                    settingsFromVideo = true
+                    loc = Loc.ShapingPage
+                    renderer.mode = VrRenderer.Mode.BROWSER
+                    refresh()
+                }
+                7 -> audioManager().adjustStreamVolume(
                     android.media.AudioManager.STREAM_MUSIC,
                     android.media.AudioManager.ADJUST_RAISE,
                     android.media.AudioManager.FLAG_SHOW_UI)
-                7 -> audioManager().adjustStreamVolume(
+                8 -> audioManager().adjustStreamVolume(
                     android.media.AudioManager.STREAM_MUSIC,
                     android.media.AudioManager.ADJUST_LOWER,
                     android.media.AudioManager.FLAG_SHOW_UI)
-                8 -> { settings.videoZoom = (settings.videoZoom - 0.1f).coerceIn(0.3f, 2.5f); applyOptics() }
-                9 -> { settings.videoZoom = (settings.videoZoom + 0.1f).coerceIn(0.3f, 2.5f); applyOptics() }
-                10 -> enterBrowser() // 3D file browser, staying in the open folder
+                9 -> { settings.videoZoom = (settings.videoZoom - 0.1f).coerceIn(0.3f, 2.5f); applyOptics() }
+                10 -> { settings.videoZoom = (settings.videoZoom + 0.1f).coerceIn(0.3f, 2.5f); applyOptics() }
+                11 -> enterBrowser() // 3D file browser, staying in the open folder
             }
             is VrRenderer.MenuEvent.Seek -> {
                 val d = p.duration.coerceAtLeast(0)

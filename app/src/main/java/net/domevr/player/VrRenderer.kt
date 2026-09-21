@@ -7,6 +7,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.SurfaceTexture
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
@@ -46,6 +47,10 @@ class VrRenderer(
 
     @Volatile var mode: Mode = Mode.BROWSER
     @Volatile var projection: Projection = Projection.DEG180
+    /** Vertical stretch at poles for DEG180: 0 = linear, 0.45 ≈ 45% more top/bottom FOV. */
+    @Volatile var domeStretchK: Float = 0.45f
+    /** Stretch onset: half-height |p| where stretch starts (0.30 = 20% from top/bottom). */
+    @Volatile var domeOnset: Float = 0.30f
     @Volatile var stereo: Stereo = Stereo.SBS
     @Volatile var fovDeg: Float = 68f
     @Volatile var eyeHalfM: Float = 0.032f
@@ -104,7 +109,14 @@ class VrRenderer(
         val slideKey: String? = null,
         val slideMin: Float = 0f,
         val slideMax: Float = 1f,
-        val slideVal: Float = 0f
+        val slideVal: Float = 0f,
+        val segLabels: List<String> = emptyList(),
+        val segActions: List<String> = emptyList(),
+        val segSelected: Int = -1,
+        val previewMags: FloatArray? = null, // shaping preview: per-point 0..1
+        val previewHull: IntArray? = null, // shaping preview: convex-hull indices
+        val previewN: Int = 9, // shaping preview grid size
+        val previewPos: FloatArray? = null // shaping preview: absolute [x,y] per point, [0,1], y down
     ) {
         companion object {
             const val FOLDER = 0; const val VIDEO = 1; const val FILE = 2; const val ACTION = 3
@@ -116,6 +128,11 @@ class VrRenderer(
     private var scroll = 0
     private var dwellStart = 0L
     private var dwellFiredFor = -2
+    // X close button (title bar, top right): own dwell state, fires sentinel -10.
+    // Hit zone in panel TEX coords: x > 920, y < ROWS_Y0 (above the rows).
+    private var inXZone = false
+    private var xProgF = 0f
+    private var xDwellFired = false
     fun tapSelect() { val h = highlight; if (h in browserRows.indices) onBrowserActivate(h, null) }
     fun moveHighlight(d: Int) {
         val n = browserRows.size
@@ -340,7 +357,7 @@ class VrRenderer(
 
     companion object {
         const val VISIBLE_ROWS = 12
-        const val MENU_BUTTONS = 11
+        const val MENU_BUTTONS = 12
         const val TEX = 1024
         const val ROWS_Y0 = 150
         const val ROW_H = 64
@@ -561,8 +578,10 @@ void main(){
         Matrix.perspectiveM(projM, 0, fovDeg.coerceIn(40f, 110f), (w / 2f) / h, 0.1f, 100f)
         Matrix.perspectiveM(videoProjM, 0, fovDeg.coerceIn(40f, 110f), (w / 2f) / h, 0.1f, 100f)
         val cur: Mode = mode
-        if (cur == Mode.VIDEO && meshKey != projection.name) {
-            mesh = buildMesh(projection); meshKey = projection.name
+        val wantMeshKey = projection.name + "|k=" + domeStretchK.toString() + "|o=" + domeOnset.toString() +
+            "|sh=" + shapingRevision.toString()
+        if (meshKey != wantMeshKey) {
+            mesh = buildMesh(projection); meshKey = wantMeshKey
         }
         // effective orientation in screen frame (identity at recenter)
         synchronized(rawM) { computeEffLocked(rawM, effM) }
@@ -614,7 +633,10 @@ void main(){
                 GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fboId)
                 GLES20.glViewport(0, 0, fw, fh)
                 GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-                if (cur == Mode.VIDEO) drawVideo(eye, warpCx, eyeAspect) else drawBrowser(warpCx, eyeAspect)
+                // Panels float over live video: in BROWSER mode the video
+                // keeps rendering behind the panel (when frames have arrived).
+                if (cur == Mode.VIDEO) drawVideo(eye, warpCx, eyeAspect)
+                else { if (arrivedFrames > 0) drawVideo(eye, warpCx, eyeAspect); drawBrowser(warpCx, eyeAspect) }
                 if (cur == Mode.VIDEO && menuOpen) drawMenuPanel(warpCx, eyeAspect)
                 // mipmaps for the distortion minification (smooth, not chunky)
                 GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTexId)
@@ -624,7 +646,8 @@ void main(){
                 drawDistortionQuad(eyeAspect)
             } else {
                 GLES20.glViewport(vp * w / 2, 0, w / 2, h)
-                if (cur == Mode.VIDEO) drawVideo(eye, warpCx, eyeAspect) else drawBrowser(warpCx, eyeAspect)
+                if (cur == Mode.VIDEO) drawVideo(eye, warpCx, eyeAspect)
+                else { if (arrivedFrames > 0) drawVideo(eye, warpCx, eyeAspect); drawBrowser(warpCx, eyeAspect) }
                 if (cur == Mode.VIDEO && menuOpen) drawMenuPanel(warpCx, eyeAspect)
             }
             // Menu lives in the browser's pipeline (FBO + flatM with
@@ -636,7 +659,8 @@ void main(){
             // screen-space pointer, re-warped to the displayed position:
             // project the world hit with this eye's rotation-only matrix
             if (cur == Mode.BROWSER && hitValid)
-                drawScreenPointer(hitX, hitY, -panelDistM, flatM, eyeAspect, browserDwellProg())
+                drawScreenPointer(hitX, hitY, -panelDistM, flatM, eyeAspect,
+                    if (inXZone) xProgF.coerceIn(0f, 1f) else browserDwellProg())
         }
     }
 
@@ -808,7 +832,7 @@ void main(){
 
     private fun updateGaze() {
         val rows = browserRows
-        if (rows.isEmpty()) { highlight = -1; hitValid = false; return }
+        if (rows.isEmpty()) { highlight = -1; hitValid = false; inXZone = false; xDwellFired = false; return }
         if (now() < inputGraceUntil) { dwellStart = now(); return }
         // Windowed stillness + leaky dwell (same as the play menu): jitter
         // and row churn only dent progress instead of zeroing the timer.
@@ -832,6 +856,24 @@ void main(){
                 hitX = hx; hitY = hy; hitValid = true
                 val u = (hx + hw) / (2 * hw)
                 val v = (hh - hy) / (2 * hh)
+                // X close button: top-right title bar, above the rows.
+                if (u > 0.90f && v * TEX < ROWS_Y0) {
+                    inXZone = true
+                    highlight = -1; dwellFiredFor = -2
+                    browProgF = maxOf(0f, browProgF - dtMs / 600f)
+                    if (still) xProgF += dtMs / dwellMs.toFloat()
+                    else xProgF = maxOf(0f, xProgF - dtMs / 600f)
+                    if (still && !xDwellFired && xProgF >= 1f) {
+                        xDwellFired = true
+                        xProgF = 0f
+                        onBrowserActivate(-10, null)
+                        return
+                    }
+                    return
+                }
+                inXZone = false
+                xDwellFired = false
+                xProgF = maxOf(0f, xProgF - dtMs / 600f)
                 val vi = ((v * TEX - ROWS_Y0) / ROW_H).toInt()
                 if (vi in 0 until VISIBLE_ROWS) {
                     val idx = (scroll + vi).coerceIn(0, rows.size - 1)
@@ -858,6 +900,9 @@ void main(){
         }
         // not hovering the panel: hide cursor, drain progress (no zeroing)
         hitValid = false
+        inXZone = false
+        xDwellFired = false
+        xProgF = maxOf(0f, xProgF - 16f / 600f)
         browProgF = maxOf(0f, browProgF - 16f / 600f)
     }
 
@@ -910,11 +955,11 @@ void main(){
     // leaky dwell integrators: progress grows while still on target and
     // drains slowly otherwise. Resets can never win against tremor or
     // target churn — flicker only dents progress instead of zeroing it.
-    private val menuProg = FloatArray(12)
+    private val menuProg = FloatArray(13)
     private var menuProgT = 0L
     private var browProgF = 0f
     private var browProgT = 0L
-    private fun menuSlot(id: Int) = if (id == -1) 11 else id
+    private fun menuSlot(id: Int) = if (id == -1) 12 else id
     private fun menuUsable(id: Int) = id != -2
 
     /** Effective open angle (always 30..85) and side derived from the sign. */
@@ -1167,13 +1212,84 @@ void main(){
         return tex[0]
     }
 
+    /** Shaping preview cell: distorted 9x9 grid + moved dots (amber→red by
+     *  magnitude) + displacement vectors + minimum convex polygon of moved
+     *  points. Box is 56px at row left; grid coords [0,1], y down. */
+    private fun drawShapePreview(c: Canvas, p: Paint, r: BrowserRow, y: Int) {
+        val mags = r.previewMags ?: return
+        val pos = r.previewPos ?: return
+        val n = r.previewN.coerceAtLeast(2)
+        if (mags.size < n * n || pos.size < n * n * 2) return
+        val bx0 = 28f; val by0 = y.toFloat() + 4f; val bs = 56f
+        fun px(j: Int) = bx0 + pos[j * 2].toFloat().coerceIn(-0.2f, 1.2f) * bs
+        fun py(j: Int) = by0 + pos[j * 2 + 1].toFloat().coerceIn(-0.2f, 1.2f) * bs
+        fun nx(j: Int) = bx0 + (j % n).toFloat() / (n - 1) * bs
+        fun ny(j: Int) = by0 + (j / n).toFloat() / (n - 1) * bs
+        // convex hull fill + stroke
+        val hull = r.previewHull
+        if (hull != null && hull.size >= 3) {
+            val path = Path()
+            path.moveTo(px(hull[0]), py(hull[0]))
+            for (k in 1 until hull.size) path.lineTo(px(hull[k]), py(hull[k]))
+            path.close()
+            p.style = Paint.Style.FILL; p.color = Color.argb(40, 8, 145, 178)
+            c.drawPath(path, p)
+            p.style = Paint.Style.STROKE; p.strokeWidth = 2f; p.color = Color.rgb(8, 145, 178)
+            c.drawPath(path, p)
+            p.style = Paint.Style.FILL; p.strokeWidth = 1f
+        }
+        // distorted grid lines
+        p.style = Paint.Style.STROKE; p.strokeWidth = 1f; p.color = Color.rgb(150, 150, 150)
+        for (i in 0 until n) {
+            val rowPath = Path()
+            rowPath.moveTo(px(i * n), py(i * n))
+            for (j in 1 until n) rowPath.lineTo(px(i * n + j), py(i * n + j))
+            c.drawPath(rowPath, p)
+            val colPath = Path()
+            colPath.moveTo(px(i), py(i))
+            for (k in 1 until n) colPath.lineTo(px(k * n + i), py(k * n + i))
+            c.drawPath(colPath, p)
+        }
+        p.style = Paint.Style.FILL
+        // displacement vectors (nominal -> offset), faint (style still STROKE)
+        p.color = Color.argb(120, 125, 211, 252); p.strokeWidth = 1f
+        for (j in mags.indices) {
+            if (mags[j] <= 1e-6f) continue
+            c.drawLine(nx(j), ny(j), px(j), py(j), p)
+        }
+        p.style = Paint.Style.FILL
+        // dots: grey unmoved, amber->red moved
+        for (j in mags.indices) {
+            val m = mags[j].coerceIn(0f, 1f)
+            val x = px(j); val yy = py(j)
+            if (m <= 1e-6f) {
+                p.color = Color.rgb(170, 170, 170)
+                c.drawCircle(x, yy, 2f, p)
+            } else {
+                val t = m.coerceAtLeast(0.15f)
+                p.color = Color.rgb(255, (200 - 170 * t).toInt(), (60 - 40 * t).toInt())
+                c.drawCircle(x, yy, 2f + 3f * t, p)
+            }
+        }
+        p.strokeWidth = 1f
+    }
+
     private fun maybeUploadBrowser() {
         ensureVisible()
         val rows = browserRows
         val end = (scroll + VISIBLE_ROWS).coerceAtMost(rows.size)
         var h = browserTitle.hashCode() * 31 + scroll
-        for (i in scroll until end) h = h * 31 + rows[i].label.hashCode() * 7 + rows[i].meta.hashCode()
-        h = h * 31 + highlight
+        for (i in scroll until end) {
+            h = h * 31 + rows[i].label.hashCode() * 7 + rows[i].meta.hashCode() + rows[i].segSelected
+            // shaping previews change with weights/toggles: sample magnitudes into the hash
+            val pm = rows[i].previewMags
+            if (pm != null) {
+                var j = 0
+                while (j < pm.size) { h = h * 31 + (pm[j] * 1000).toInt(); j += 7 }
+                h = h * 31 + (rows[i].previewHull?.size ?: 0)
+            }
+        }
+        h = h * 31 + highlight + (if (inXZone) 1009 else 0)
         if (h == lastPanelHash && browserBitmap != null) return
         lastPanelHash = h
         val bmp = Bitmap.createBitmap(TEX, TEX, Bitmap.Config.ARGB_8888)
@@ -1181,7 +1297,15 @@ void main(){
         c.drawColor(Color.rgb(13, 20, 28))
         val p = Paint(Paint.ANTI_ALIAS_FLAG)
         p.color = Color.WHITE; p.textSize = 44f
-        c.drawText(browserTitle.take(40), 40f, 72f, p)
+        c.drawText(browserTitle.take(30), 40f, 72f, p)
+        // X close button, top right (hit zone u>0.90, above ROWS_Y0)
+        if (inXZone) {
+            p.color = Color.rgb(30, 58, 95)
+            c.drawRect(920f, 16f, 1004f, 96f, p)
+        }
+        p.color = Color.WHITE; p.textSize = 44f; p.textAlign = Paint.Align.CENTER
+        c.drawText("✕", 962f, 72f, p)
+        p.textAlign = Paint.Align.LEFT
         p.textSize = 26f; p.color = Color.rgb(125, 211, 252)
         c.drawText("stare to select • tap = center view • vol keys = volume", 40f, 114f, p)
         var y = ROWS_Y0
@@ -1191,6 +1315,37 @@ void main(){
                 p.color = Color.rgb(30, 58, 95)
                 c.drawRect(20f, y.toFloat(), 1004f, (y + ROW_H).toFloat(), p)
             }
+            if (r.previewMags != null && r.previewPos != null) {
+                // shaping preview row: mini 9x9 grid with moved dots, hull + vectors
+                drawShapePreview(c, p, r, y)
+                p.color = Color.WHITE; p.textSize = 30f; p.textAlign = Paint.Align.LEFT
+                c.drawText(r.label.take(24), 100f, (y + 36).toFloat(), p)
+                if (r.meta.isNotEmpty()) {
+                    p.color = Color.rgb(148, 163, 184); p.textSize = 20f
+                    c.drawText(r.meta.take(40), 100f, (y + 58).toFloat(), p)
+                }
+            } else if (r.segLabels.isNotEmpty()) {
+                // segmented button row: N equal buttons across the row width
+                val n = r.segLabels.size
+                val x0 = 20f; val x1 = 1004f
+                val bw = (x1 - x0) / n
+                p.textSize = 30f; p.textAlign = Paint.Align.CENTER
+                for (s in 0 until n) {
+                    val sx0 = x0 + s * bw + 3f
+                    val sx1 = x0 + (s + 1) * bw - 3f
+                    if (s == r.segSelected) {
+                        p.color = Color.rgb(8, 145, 178)
+                        c.drawRect(sx0, y.toFloat() + 6f, sx1, (y + ROW_H - 6).toFloat(), p)
+                        p.color = Color.WHITE
+                    } else {
+                        p.color = Color.rgb(51, 65, 85)
+                        c.drawRect(sx0, y.toFloat() + 6f, sx1, (y + ROW_H - 6).toFloat(), p)
+                        p.color = Color.rgb(203, 213, 225)
+                    }
+                    c.drawText(r.segLabels[s].take(12), (sx0 + sx1) / 2f, (y + 41).toFloat(), p)
+                }
+                p.textAlign = Paint.Align.LEFT
+            } else {
             val icon = when (r.kind) {
                 BrowserRow.FOLDER -> "📁"
                 BrowserRow.VIDEO -> "🎬"
@@ -1213,6 +1368,7 @@ void main(){
             } else if (r.meta.isNotEmpty()) {
                 p.color = Color.rgb(148, 163, 184); p.textSize = 24f
                 c.drawText("    ${r.meta.take(56)}", 44f, (y + 58).toFloat(), p)
+            }
             }
             y += ROW_H
         }
@@ -1273,8 +1429,8 @@ void main(){
         val c = Canvas(bmp)
         c.drawColor(Color.rgb(10, 14, 22))
         val p = Paint(Paint.ANTI_ALIAS_FLAG)
-        val icons = arrayOf("⏮", "−10s", if (menuPlaying) "⏸" else "▶", "+10s", "⏭", "⚙", "🔊+", "🔊−", "Z−", "Z+", "📁")
-        val caps = arrayOf("prev", "rew", "play", "ff", "next", "settings", "vol+", "vol−", "zoom−", "zoom+", "files")
+        val icons = arrayOf("⏮", "−10s", if (menuPlaying) "⏸" else "▶", "+10s", "⏭", "⚙", "⧗", "🔊+", "🔊−", "Z−", "Z+", "📁")
+        val caps = arrayOf("prev", "rew", "play", "ff", "next", "settings", "shape", "vol+", "vol−", "zoom−", "zoom+", "files")
         val bw = (W.toFloat() * 4f / 6f) / MENU_BUTTONS
         val bx0 = W.toFloat() / 6f
         for (i in 0 until MENU_BUTTONS) {
@@ -1315,29 +1471,88 @@ void main(){
     // ---- meshes ----
     private data class Mesh(val verts: FloatBuffer, val tex: FloatBuffer, val indices: java.nio.ShortBuffer, val indexCount: Int)
 
+    /** One enabled shaping grid: offsets in half-frame normalized units
+     *  (ox +right, oy +down/grid-space), weight 0..1. Arrays never mutated
+     *  after creation; the whole list is replaced atomically (volatile). */
+    data class ActiveShape(val ox: FloatArray, val oy: FloatArray, val weight01: Float, val n: Int)
+    @Volatile var shapingActive: List<ActiveShape> = emptyList()
+    @Volatile var shapingRevision: Int = 0
+
     private fun buildMesh(proj: Projection): Mesh {
-        return when (proj) {
+        val m = when (proj) {
             Projection.FLAT -> gridQuadP(
                 floatArrayOf(-3.2f, 1.8f, -4f), floatArrayOf(3.2f, 1.8f, -4f),
                 floatArrayOf(-3.2f, -1.8f, -4f), floatArrayOf(3.2f, -1.8f, -4f),
                 24, 12
             )
             Projection.FISHEYE -> sphereSegment(180f, flipX = true)
-            Projection.DEG180 -> sphereSegment(180f)
+            Projection.DEG180 -> sphereSegment(180f, stretchK = domeStretchK)
             Projection.DEG220 -> sphereSegment(220f)
             Projection.DEG270 -> sphereSegment(270f)
             Projection.DEG360 -> sphereSegment(360f)
         }
+        return bakeShaping(m)
     }
 
-    private fun sphereSegment(deg: Float, flipX: Boolean = false): Mesh {
+    /** Bake the normalized weighted-average shaping grid into the video mesh
+     *  UVs (texture space, so head tracking via MVP is unaffected). Mesh UVs
+     *  are per-half-frame: u right, v up (GL origin). Grid space is y down,
+     *  so grid_v = 1 - v and dy flips sign on write. No-op when nothing
+     *  enabled (identity = same sampling as unwarped). */
+    private fun bakeShaping(m: Mesh): Mesh {
+        val active = shapingActive
+        if (active.isEmpty()) return m
+        val n = active[0].n
+        var wsum = 0f
+        for (a in active) if (a.n == n) wsum += a.weight01
+        if (wsum <= 0f) return m
+        // Combine on the fly per vertex (meshes are small: 25x49 sphere, 25x13 flat).
+        val count = m.tex.capacity() / 2
+        val out = FloatArray(m.tex.capacity())
+        m.tex.rewind()
+        for (k in 0 until count) {
+            val u = m.tex.get()
+            val v = m.tex.get()
+            // bilinear sample of averaged offsets at grid coords (u, 1-v)
+            var dx = 0f; var dy = 0f
+            val gx = (u.coerceIn(0f, 1f) * (n - 1)).coerceIn(0f, (n - 1).toFloat())
+            val gv = ((1f - v).coerceIn(0f, 1f) * (n - 1)).coerceIn(0f, (n - 1).toFloat())
+            val x0 = gx.toInt().coerceAtMost(n - 2); val y0 = gv.toInt().coerceAtMost(n - 2)
+            val fx = gx - x0; val fy = gv - y0
+            for (a in active) {
+                if (a.n != n) continue
+                val w = a.weight01 / wsum
+                fun at(ix: Int, iy: Int, arr: FloatArray) = arr[iy * n + ix]
+                val ox = (at(x0, y0, a.ox) * (1 - fx) + at(x0 + 1, y0, a.ox) * fx) * (1 - fy) +
+                         (at(x0, y0 + 1, a.ox) * (1 - fx) + at(x0 + 1, y0 + 1, a.ox) * fx) * fy
+                val oy = (at(x0, y0, a.oy) * (1 - fx) + at(x0 + 1, y0, a.oy) * fx) * (1 - fy) +
+                         (at(x0, y0 + 1, a.oy) * (1 - fx) + at(x0 + 1, y0 + 1, a.oy) * fx) * fy
+                dx += w * ox; dy += w * oy
+            }
+            out[k * 2] = u + dx
+            out[k * 2 + 1] = v - dy
+        }
+        m.tex.rewind()
+        return Mesh(m.verts, fb(out), m.indices, m.indexCount)
+    }
+
+    private fun sphereSegment(deg: Float, flipX: Boolean = false, stretchK: Float = 0f): Mesh {
         val rows = 24; val cols = 48
         val r = 8f
         val yawMax = Math.toRadians((deg / 2).toDouble())
         val verts = mutableListOf<Float>(); val texs = mutableListOf<Float>()
         for (iy in 0..rows) {
             val v = iy.toFloat() / rows
-            val pitch = Math.PI * (v - 0.42)
+            // Vertical stretch: dead-zone |p|<onset (onset 0.30 = starts 20% from top/bottom),
+            // fast ramp to poles. Centre v=0.5 stays at pitch 0; poles stretched by (1+k).
+            val p = v - 0.5f
+            val absP = kotlin.math.abs(p)
+            val onset = domeOnset.coerceIn(0f, 0.45f)
+            val width = (0.5f - onset).coerceAtLeast(0.05f)
+            val t = ((absP - onset) / width).coerceIn(0f, 1f)
+            val s = 1f - (1f - t) * (1f - t)
+            val stretch = 1f + stretchK * s
+            val pitch = Math.PI * p * stretch
             for (ix in 0..cols) {
                 val u = ix.toFloat() / cols
                 val yaw = -yawMax + u * 2 * yawMax

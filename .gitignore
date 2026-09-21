@@ -13,3 +13,8 @@ local.properties
 # Captured logs / traces
 *.log
 *.hprof
+# Generated at build time by copyShapingAssets (authored copy lives in misc/)
+app/src/main/assets/shaping/
+# Python bytecode from misc/shapemesh.py runs
+__pycache__/
+*.pyc

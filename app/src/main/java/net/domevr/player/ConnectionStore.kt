@@ -96,6 +96,21 @@ class SettingsStore(ctx: Context) {
     var dwellMs: Long
         get() = p.getLong("dwell", 1500L).coerceIn(400L, 4000L)
         set(v) { p.edit().putLong("dwell", v).apply() }
+    /** Shaping grid enabled (per shape id, see shaping/shapes.json). */
+    fun shapeEnabled(id: String): Boolean = p.getBoolean("shape_on_$id", false)
+    fun setShapeEnabled(id: String, v: Boolean) { p.edit().putBoolean("shape_on_$id", v).apply() }
+    /** Shaping grid weight 0..100% (per shape id). Default 100%. */
+    fun shapeWeight(id: String): Float = p.getFloat("shape_w_$id", 100f).coerceIn(0f, 100f)
+    fun setShapeWeight(id: String, v: Float) { p.edit().putFloat("shape_w_$id", v).apply() }
+    /** DEG180 vertical stretch onset: half-height |p| where stretch starts.
+     *  Displayed as % from top/bottom edge = (0.5 - onset) * 100. */
+    var domeOnset: Float
+        get() = p.getFloat("dome_onset", 0.30f).coerceIn(0f, 0.45f)
+        set(v) { p.edit().putFloat("dome_onset", v).apply() }
+    /** DEG180 vertical stretch strength at poles (0 = linear, 3.0 = insane). */
+    var domeStretchK: Float
+        get() = p.getFloat("dome_stretch", 0.45f).coerceIn(0f, 3f)
+        set(v) { p.edit().putFloat("dome_stretch", v).apply() }
     /** Pin video in front of the viewer (screen lock); off = look-around. */
     var pinVideo: Boolean
         get() = p.getBoolean("pin_video", false)

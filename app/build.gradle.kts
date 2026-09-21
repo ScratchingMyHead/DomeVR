@@ -11,8 +11,8 @@ android {
         applicationId = "net.domevr.player"
         minSdk = 26
         targetSdk = 34
-        versionCode = 54
-        versionName = "0.6.16"
+        versionCode = 56
+        versionName = "0.6.18-shaping"
     }
 
     buildTypes {
@@ -34,6 +34,14 @@ android {
         buildConfig = true
     }
 }
+
+// Authored shape grids live in misc/shapes.json (edited via misc/shapemesh.py).
+// Copy into APK assets at build time; runtime loads "shaping/shapes.json".
+tasks.register<Copy>("copyShapingAssets") {
+    from("$rootDir/misc/shapes.json")
+    into("src/main/assets/shaping")
+}
+tasks.named("preBuild") { dependsOn("copyShapingAssets") }
 
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
