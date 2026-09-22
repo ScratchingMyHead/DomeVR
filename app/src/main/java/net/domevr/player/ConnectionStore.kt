@@ -170,4 +170,8 @@ class SettingsStore(ctx: Context) {
     var menuTop: Boolean
         get() = p.getBoolean("menu_top", true)
         set(v) { p.edit().putBoolean("menu_top", v).apply() }
+    /** Head-circle gesture arms recenter aim (VIDEO mode, menu closed). */
+    var circleRecenter: Boolean
+        get() = p.getBoolean("circle_recenter", true)
+        set(v) { p.edit().putBoolean("circle_recenter", v).apply() }
 }

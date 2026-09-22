@@ -358,7 +358,8 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         }
         glView.setOnTouchListener { _, e ->
             // Tap recenters silently: the world snapping is its own feedback.
-            if (e.action == MotionEvent.ACTION_UP) renderer.recenter("tap")
+            // While the blue aim is armed the tap cancels it instead.
+            if (e.action == MotionEvent.ACTION_UP && !renderer.cancelAim()) renderer.recenter("tap")
             true
         }
 
@@ -460,6 +461,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         renderer.menuAngleUp = settings.menuAngleUp
         renderer.menuAngleDown = settings.menuAngleDown
         renderer.menuSideUp = settings.menuTop
+        renderer.circleGestureEnabled = settings.circleRecenter
         // Convergence: each screen half is its own NDC range, so move each
         // eye's image toward its half-center until the centers sit ipdMm
         // apart. o = 1 - ipd/spacing (NDC units), clamped to stay on-screen.
@@ -1363,6 +1365,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                     renderer.menuToggleSide()
                     settings.menuTop = renderer.menuSideUp
                 }
+                13 -> renderer.requestAim() // menu closes, blue aim arms
             }
             is VrRenderer.MenuEvent.Seek -> {
                 val d = p.duration.coerceAtLeast(0)

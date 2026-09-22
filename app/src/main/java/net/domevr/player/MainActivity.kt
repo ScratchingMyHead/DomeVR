@@ -549,6 +549,9 @@ class MainActivity : AppCompatActivity() {
             settings.softwareDecode = b
             Toast.makeText(this, "Takes effect on next video", Toast.LENGTH_SHORT).show()
         }
+        val swCirc = v.findViewById<com.google.android.material.switchmaterial.SwitchMaterial>(R.id.switchCircleRecenter)
+        swCirc.isChecked = settings.circleRecenter
+        swCirc.setOnCheckedChangeListener { _, b -> settings.circleRecenter = b }
         val sw = v.findViewById<com.google.android.material.switchmaterial.SwitchMaterial>(R.id.switchStartInVrBrowser)
         sw.isChecked = settings.startInVrBrowser
         sw.setOnCheckedChangeListener { _, b -> settings.startInVrBrowser = b }

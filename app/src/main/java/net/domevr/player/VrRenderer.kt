@@ -289,6 +289,8 @@ class VrRenderer(
     private var browserBitmap: Bitmap? = null
     private var lastPanelHash = 0
     private var reticleTexId = -1
+    /** Blue twin of the dwell reticle, for the recenter aim pointer. */
+    private var aimTexId = -1
 
     private val projM = FloatArray(16)
     private val projEyeM = FloatArray(16)
@@ -453,7 +455,7 @@ class VrRenderer(
 
     companion object {
         const val VISIBLE_ROWS = 13
-        const val MENU_BUTTONS = 13
+        const val MENU_BUTTONS = 14
         const val TEX = 1024
         const val ROWS_Y0 = 150
         const val ROW_H = 64
@@ -601,7 +603,8 @@ void main(){
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
 
-        reticleTexId = makeReticle()
+        reticleTexId = makeReticle(Color.RED)
+        aimTexId = makeReticle(Color.rgb(96, 165, 250))
 
         GLES20.glGenTextures(1, tex, 0)
         menuTexId = tex[0]
@@ -760,6 +763,10 @@ void main(){
             // (see drawScreenPointer): seen and computed agree.
             if (cur == Mode.VIDEO && menuOpen && menuStickyValid)
                 drawScreenPointer(menuStickyW[0], menuStickyW[1], menuStickyW[2], flatM, eyeAspect, menuDwellProg())
+            // recenter aim pointer: blue twin, 2x size, 2x dwell to a point
+            if (cur == Mode.VIDEO && aimArmed)
+                drawScreenPointer(aimW[0], aimW[1], aimW[2], flatM, eyeAspect,
+                    aimProg.coerceIn(0f, 1f), 2f, aimTexId)
             // screen-space pointer, re-warped to the displayed position:
             // project the world hit with this eye's rotation-only matrix
             if (cur == Mode.BROWSER && hitValid)
@@ -794,7 +801,8 @@ void main(){
      *  HALF viewport, so its center is NDC (0,0) per eye — warping toward
      *  the half-centers (±0.5) lands a quarter-screen off and doubles. */
     private fun drawScreenPointer(
-        wx: Float, wy: Float, wz: Float, mat: FloatArray, aspect: Float, prog: Float
+        wx: Float, wy: Float, wz: Float, mat: FloatArray, aspect: Float, prog: Float,
+        sizeMul: Float = 1f, texId: Int = -1
     ) {
         v4[0] = wx; v4[1] = wy; v4[2] = wz; v4[3] = 1f
         Matrix.multiplyMV(clipV, 0, mat, 0, v4, 0)
@@ -810,12 +818,12 @@ void main(){
         var nx = (0.5f + dx * s / aspect) * 2f - 1f
         var ny = (0.5f + dy * s) * 2f - 1f
         if (nx < -1.2f || nx > 1.2f || ny < -1.2f || ny > 1.2f) return
-        val sx = 0.022f * (1f - 0.85f * prog)
+        val sx = 0.022f * sizeMul * (1f - 0.85f * prog)
         val sy = sx * aspect
         putQuad(ptrVerts, ptrTex, nx - sx, ny - sy, nx + sx, ny + sy)
         GLES20.glUseProgram(prog2d)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, reticleTexId)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, if (texId < 0) reticleTexId else texId)
         GLES20.glUniform1i(uTex2d, 0)
         GLES20.glUniformMatrix4fv(uMvp2d, 1, false, identM, 0)
         // screen-space pointer: warp stays off (ring must stay round)
@@ -1145,11 +1153,11 @@ void main(){
     // leaky dwell integrators: progress grows while still on target and
     // drains slowly otherwise. Resets can never win against tremor or
     // target churn — flicker only dents progress instead of zeroing it.
-    private val menuProg = FloatArray(14)
+    private val menuProg = FloatArray(15)
     private var menuProgT = 0L
     private var browProgF = 0f
     private var browProgT = 0L
-    private fun menuSlot(id: Int) = if (id == -1) 13 else id
+    private fun menuSlot(id: Int) = if (id == -1) 14 else id
     private fun menuUsable(id: Int) = id != -2
     // Play-menu column geometry shared by drawing + hit-testing: 11 columns
     // across the middle 5/6, with wider empty gaps (no divider lines) after
@@ -1196,8 +1204,165 @@ void main(){
 
     // ---------- play menu ----------
 
+    /** Circle-to-recenter gesture master switch (2D settings, default on). */
+    @Volatile var circleGestureEnabled = true
+    /** UI-thread request: close the menu and arm the aim pointer (GL consumes). */
+    @Volatile private var aimRequest = false
+    /** Aim pointer live. Volatile: armed/cleared on GL, read on UI (tap cancels). */
+    @Volatile private var aimArmed = false
+    // GL-thread aim dwell state (head-locked big blue pointer, 2x dwell)
+    private var aimProg = 0f
+    private var aimT = 0L
+    private var aimArmedAt = 0L
+    private val aimW = FloatArray(3)
+    // circle detector: fixed ring buffer, zero per-frame allocation
+    // (160 slots ≈ 5.3s at the 33ms sample step: the window must be
+    // longer than the gesture, or the first loop ages out mid-draw)
+    private val circT = LongArray(160)
+    private val circX = FloatArray(160)
+    private val circY = FloatArray(160)
+    private var circHead = 0
+    private var circN = 0
+    private var circLastT = 0L
+    private var circCooldownUntil = 0L
+    private var circNearT = 0L
+
+    /** Dwell the toolbar button / draw a circle to call this: the menu
+     *  closes and a big blue pointer arms — stare at the new forward for
+     *  2x the gaze delay and the snap fires there. */
+    fun requestAim() { aimRequest = true }
+    /** Tap while armed cancels the aim instead of snapping. True if consumed. */
+    fun cancelAim(): Boolean {
+        if (!aimArmed && !aimRequest) return false
+        aimArmed = false; aimRequest = false; aimProg = 0f
+        FileLog.i("DomeVR-menu", "aim cancelled")
+        return true
+    }
+
+    /** Aim dwell: progress grows while still (2x the menu dwell), drains
+     *  on motion; at full the basis snaps to the faced direction. */
+    private fun updateAim() {
+        val nowMs = now()
+        val dtMs = (nowMs - aimT).coerceIn(0L, 500L)
+        aimT = nowMs
+        if (nowMs - aimArmedAt > 15000L) {
+            aimArmed = false; aimProg = 0f
+            FileLog.i("DomeVR-menu", "aim timeout")
+            return
+        }
+        val still = synchronized(rawM) { menuStill.update(rawM, nowMs) }
+        if (still) aimProg += dtMs / dwellMs.toFloat()
+        else aimProg = maxOf(0f, aimProg - dtMs / 600f)
+        val d = panelDistM
+        val f = lastEffFwd
+        aimW[0] = f[0] * d; aimW[1] = f[1] * d; aimW[2] = f[2] * d
+        if (aimProg >= 1f) {
+            aimProg = 0f; aimArmed = false
+            recenter("aim")
+            FileLog.i("DomeVR-menu", "aim FIRE -> recenter")
+        }
+    }
+
+    /** Circle-to-recenter: signed turning angle of the forward-vector
+     *  trail in the x/y plane. ONE full loop accumulates to ±~300°;
+     *  nods, shakes and look-and-returns self-cancel to ~0, which is
+     *  what makes circles robust where linear swipes false-positive.
+     *  Fires aim mode (never a blind snap). */
+    private fun updateCircle() {
+        val nowMs = now()
+        if (nowMs < circCooldownUntil) return
+        if (nowMs - circLastT < 33L) return
+        circLastT = nowMs
+        val f = lastEffFwd
+        circT[circHead] = nowMs; circX[circHead] = f[0]; circY[circHead] = f[1]
+        circHead = (circHead + 1) % circT.size
+        if (circN < circT.size) circN++
+        // window: trailing 5000ms, oldest -> newest
+        var m = 0
+        var mx = 0f; var my = 0f
+        var idx = (circHead - circN + circT.size * 2) % circT.size
+        for (k in 0 until circN) {
+            val t = circT[idx]
+            if (nowMs - t <= 5000L) {
+                winT[m] = t; winX[m] = circX[idx]; winY[m] = circY[idx]
+                mx += winX[m]; my += winY[m]; m++
+            }
+            idx = (idx + 1) % circT.size
+        }
+        if (m < 18) return
+        val span = winT[m - 1] - winT[0]
+        if (span < 600L) return
+        mx /= m; my /= m
+        var maxR = 0f
+        for (i in 0 until m) {
+            val dx = winX[i] - mx; val dy = winY[i] - my
+            maxR = maxOf(maxR, kotlin.math.sqrt(dx * dx + dy * dy))
+        }
+        val ex = winX[m - 1] - winX[0]; val ey = winY[m - 1] - winY[0]
+        val closure = kotlin.math.sqrt(ex * ex + ey * ey)
+        var accum = 0.0; var pos = 0; var neg = 0; var travel = 0f
+        for (i in 1 until m - 1) {
+            val ax = winX[i] - winX[i - 1]; val ay = winY[i] - winY[i - 1]
+            val bx = winX[i + 1] - winX[i]; val by = winY[i + 1] - winY[i]
+            val la = kotlin.math.sqrt(ax * ax + ay * ay)
+            val lb = kotlin.math.sqrt(bx * bx + by * by)
+            if (la < 0.004f || lb < 0.004f) continue
+            travel += la
+            val a = Math.atan2((ax * by - ay * bx).toDouble(), (ax * bx + ay * by).toDouble())
+            accum += a
+            if (a > 0) pos++ else neg++
+        }
+        val signFrac = if (pos + neg > 0) maxOf(pos, neg).toFloat() / (pos + neg) else 0f
+        val accDeg = Math.toDegrees(accum)
+        fun stats() = "span=${span}ms travel=${"%.2f".format(travel)} " +
+            "acc=${accDeg.toInt()}° maxR=${"%.3f".format(maxR)} " +
+            "close=${"%.3f".format(closure)} sign=${"%.2f".format(signFrac)}"
+        // sign ≥0.60: measured real circles score 0.65-0.74 (heads
+        // wobble), random motion ~0.52 — margin on both sides
+        if (maxR in 0.09f..0.65f && closure <= 0.18f && travel >= 1.0f &&
+            kotlin.math.abs(accum) >= 5.2 && signFrac >= 0.6f
+        ) {
+            circN = 0
+            circCooldownUntil = nowMs + 3000L
+            aimRequest = true
+            FileLog.i("DomeVR-circle", "FIRE x2 ${stats()}")
+            return
+        }
+        // tuning capture: real rotation that didn't qualify (throttled 2s).
+        // The numbers say which guard failed: acc (need ±300° one loop),
+        // maxR (need 0.09..0.65 ≈ 5..40° radius), close (need ≤0.18),
+        // travel (need ≥1.0), sign (need ≥0.60), span.
+        if (kotlin.math.abs(accum) > 2.6 && nowMs - circNearT > 2000L) {
+            circNearT = nowMs
+            FileLog.i("DomeVR-circle", "near-miss ${stats()}")
+        }
+    }
+    // scratch window for the circle detector (fields, never allocated per frame)
+    private val winT = LongArray(160)
+    private val winX = FloatArray(160)
+    private val winY = FloatArray(160)
+
     private fun updateMenu() {
         val fwd = lastEffFwd
+        // recenter aim flow: consume the UI-thread request, close the menu,
+        // arm the big blue pointer (suppresses the open logic below)
+        if (aimRequest) {
+            aimRequest = false
+            if (menuWasOpen) FileLog.i("DomeVR-menu", "menu close (aim)")
+            menuOpen = false; menuHitValid = false; menuStickyValid = false
+            menuHighlight = -2; menuDwellFiredFor = -3
+            menuSeekHoverU = -1f
+            menuBelowSince = 0L
+            menuWasOpen = false
+            menuProgFresh = true
+            aimArmed = true; aimProg = 0f; aimT = now(); aimArmedAt = aimT
+            circN = 0
+            FileLog.i("DomeVR-menu", "aim armed")
+        }
+        if (aimArmed) { updateAim(); return }
+        // circle gesture: menu-closed VIDEO only; stale arcs die when the menu opens
+        if (!menuOpen) { if (circleGestureEnabled) updateCircle() }
+        else if (circN > 0) circN = 0
         // Trigger metric: head-TILT (angle of the head-up vector from
         // vertical), NOT gaze elevation. asin(fwd.y) conflates yaw with
         // pitch once the head is tilted back: yawing ±30° about the tilted
@@ -1304,7 +1469,8 @@ void main(){
                             in 0..7 -> col
                             8 -> if (v < 0.415f) 8 else 9
                             9 -> if (v < 0.415f) 10 else 11
-                            else -> 12
+                            // recenter (13) stacked above flip (12)
+                            else -> if (v < 0.415f) 13 else 12
                         }
                     }
                 menuSeekHoverU = if (id == -1) seekFrac(u) else -1f
@@ -1449,16 +1615,16 @@ void main(){
         drawMesh2d(browserGrid!!, browserTexId, flatM, warpCx, aspect)
     }
 
-    private fun makeReticle(): Int {
+    private fun makeReticle(color: Int): Int {
         val tex = IntArray(1)
         GLES20.glGenTextures(1, tex, 0)
         val bmp = Bitmap.createBitmap(96, 96, Bitmap.Config.ARGB_8888)
         val c = Canvas(bmp)
-        // transparent background (needs BLEND enabled); small red ring that
+        // transparent background (needs BLEND enabled); small ring that
         // the draw code shrinks toward a point as dwell progresses
         c.drawColor(Color.TRANSPARENT)
         val p = Paint(Paint.ANTI_ALIAS_FLAG)
-        p.color = Color.RED; p.style = Paint.Style.STROKE; p.strokeWidth = 7f
+        p.color = color; p.style = Paint.Style.STROKE; p.strokeWidth = 7f
         c.drawCircle(48f, 48f, 30f, p)
         p.style = Paint.Style.FILL
         c.drawCircle(48f, 48f, 5f, p)
@@ -1741,11 +1907,12 @@ void main(){
         p.color = Color.WHITE; p.textSize = 28f; p.textAlign = Paint.Align.CENTER
         c.drawText(menuTitle.take(48), W / 2f, 34f, p)
         p.textAlign = Paint.Align.LEFT
-        val icons = arrayOf("⚙", "⧗", "📁", "⏮", "⏪", if (menuPlaying) "⏸" else "▶", "⏩", "⏭", "", "", "", "", "⇅")
+        val icons = arrayOf("⚙", "⧗", "📁", "⏮", "⏪", if (menuPlaying) "⏸" else "▶", "⏩", "⏭", "", "", "", "", "⇅", "")
         // 11 columns across the middle 5/6 with wider empty gaps between
-        // the groups (transport | zoom | volume | flip) — see menuColXs.
-        // 0-7 + flip are full-height singles; zoom (8/9) and volume (10/11)
-        // stack + above - in one column each. Icons only, no captions.
+        // the groups (transport | zoom | volume | recenter/flip) — see menuColXs.
+        // 0-7 are full-height singles; zoom (8/9), volume (10/11) and
+        // recenter (13) over flip (12) stack in one column each.
+        // Icons only, no captions.
         fun drawBtn(id: Int, col: Int, y0: Float, y1: Float, isize: Float) {
             val x0 = menuColXs[col] + 4f; val x1 = menuColXs[col + 1] - 4f
             if (id == menuHighlight) {
@@ -1789,6 +1956,14 @@ void main(){
                     tipX - r, cy - r, tipX + r, cy + r, -55f, 110f, false, p)
                 wave(s * 0.62f)
                 if (id == 10) wave(s * 1.12f)
+            } else if (id == 13) {
+                // recenter crosshair: stroked ring + center dot
+                val r = isize * 0.30f
+                val sw = (isize * 0.09f).coerceAtLeast(3f)
+                p.color = Color.WHITE; p.style = Paint.Style.STROKE; p.strokeWidth = sw
+                c.drawCircle(cx, cy, r, p)
+                p.style = Paint.Style.FILL
+                c.drawCircle(cx, cy, sw, p)
             } else {
                 p.color = Color.WHITE; p.textSize = isize; p.textAlign = Paint.Align.CENTER
                 c.drawText(icons[id], cx, cy + isize * 0.35f, p)
@@ -1799,7 +1974,36 @@ void main(){
         drawBtn(9, 8, 146f, 236f, 48f)
         drawBtn(10, 9, 56f, 146f, 48f)
         drawBtn(11, 9, 146f, 236f, 48f)
-        drawBtn(12, 10, 56f, 236f, 60f)
+        drawBtn(13, 10, 56f, 146f, 48f)
+        drawBtn(12, 10, 146f, 236f, 48f)
+        // hover tooltip: hovered button's name in the strip ABOVE the
+        // buttons (the filename up there is briefly covered for center
+        // columns — transient, only while hovering). Stacked halves share
+        // their column's tooltip.
+        if (menuHighlight >= 0) {
+            val tipCol = when (menuHighlight) {
+                in 0..7 -> menuHighlight
+                8, 9 -> 8
+                10, 11 -> 9
+                else -> 10
+            }
+            val tips = arrayOf("settings", "shape", "files", "prev", "rew", "play",
+                "ff", "next", "zoom+", "zoom−", "vol+", "vol−", "flip", "recenter")
+            val txt = tips[menuHighlight]
+            val ccx = (menuColXs[tipCol] + menuColXs[tipCol + 1]) / 2f
+            p.textSize = 32f; p.textAlign = Paint.Align.CENTER
+            val tw = p.measureText(txt)
+            val bx0 = (ccx - tw / 2f - 14f).coerceAtLeast(8f)
+            val bx1 = (ccx + tw / 2f + 14f).coerceAtMost(1016f)
+            p.color = Color.rgb(10, 14, 22)
+            c.drawRect(bx0, 6f, bx1, 54f, p)
+            p.color = Color.rgb(125, 211, 252)
+            p.style = Paint.Style.STROKE; p.strokeWidth = 2f
+            c.drawRect(bx0, 6f, bx1, 54f, p)
+            p.style = Paint.Style.FILL
+            p.color = Color.WHITE
+            c.drawText(txt, (bx0 + bx1) / 2f, 40f, p)
+        }
         p.textAlign = Paint.Align.LEFT
         // progress bar (seek zone)
         val frac = if (menuDurMs > 0) (menuPosMs.toFloat() / menuDurMs).coerceIn(0f, 1f) else 0f

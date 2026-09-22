@@ -103,6 +103,11 @@
         android:layout_width="match_parent" android:layout_height="wrap_content"
         android:text="Software video decoding (compat, slower)" />
 
+    <com.google.android.material.switchmaterial.SwitchMaterial
+        android:id="@+id/switchCircleRecenter"
+        android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="Head-circle gesture arms recenter" />
+
     <TextView android:id="@+id/lblZoom" android:text="Video size (zoom)"
         android:textAppearance="?attr/textAppearanceTitleSmall"
         android:layout_width="wrap_content" android:layout_height="wrap_content" />
