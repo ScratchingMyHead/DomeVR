@@ -515,7 +515,23 @@ void main(){
   if (uStereo == 1) { c = vec2(float(uEye) * 0.5 + 0.25, 0.5); }
   else if (uStereo == 2) { c = vec2(0.5, float(uEye) * 0.5 + 0.25); }
   t = c + (t - c) / uZoom;
-  if (t.x < 0.0 || t.x > 1.0 || t.y < 0.0 || t.y > 1.0) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+  // Bounds check per half-image (not full [0,1]): each eye only sees its
+  // half. A full-range check lets zoom-out bleed the other eye's half in
+  // at the extremes (recovered from the binned dome-mesh branch, which
+  // had this right and master lost in a rewrite).
+  bool oob = false;
+  if (uStereo == 1) {
+    float halfMin = float(uEye) * 0.5;
+    float halfMax = halfMin + 0.5;
+    oob = (t.x < halfMin || t.x > halfMax || t.y < 0.0 || t.y > 1.0);
+  } else if (uStereo == 2) {
+    float halfMin = float(uEye) * 0.5;
+    float halfMax = halfMin + 0.5;
+    oob = (t.y < halfMin || t.y > halfMax || t.x < 0.0 || t.x > 1.0);
+  } else {
+    oob = (t.x < 0.0 || t.x > 1.0 || t.y < 0.0 || t.y > 1.0);
+  }
+  if (oob) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
   gl_FragColor = texture2D(uTex, t);
 }
 """
