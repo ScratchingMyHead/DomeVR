@@ -9,6 +9,10 @@ browsing and direct streaming — no downloads, no transcoding.
 - Look-up play menu: transport controls, volume, zoom, folder queue, seek
 - 3D settings page: video type, screen shape, lens, FOV, zoom, IPD
 
+## Sensors
+
+Head tracking needs a gyroscope (same as Cardboard itself).
+
 ## Build
 
 ```sh
