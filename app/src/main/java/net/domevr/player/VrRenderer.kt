@@ -8,6 +8,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
+import java.util.Locale
 import android.graphics.SurfaceTexture
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
@@ -104,19 +105,31 @@ class VrRenderer(
     @Volatile var browserRows: List<BrowserRow> = emptyList()
     /** A row can carry a gaze slider: dwelling at horizontal fraction u
      *  sets value = min + u·(max-min). One dwell reaches any value. */
+    /** Display format for a gaze slider's live tooltip: display value =
+     *  raw * scale + offset, snapped to the snap grid (0 = no snap),
+     *  rendered with decimals places plus suffix. Mirrors handleSlide. */
+    data class SlideFormat(
+        val suffix: String = "",
+        val decimals: Int = 0,
+        val scale: Float = 1f,
+        val offset: Float = 0f,
+        val snap: Float = 0f
+    )
     data class BrowserRow(
         val label: String, val meta: String, val kind: Int,
         val slideKey: String? = null,
         val slideMin: Float = 0f,
         val slideMax: Float = 1f,
         val slideVal: Float = 0f,
+        val slideFmt: SlideFormat? = null,
         val segLabels: List<String> = emptyList(),
         val segActions: List<String> = emptyList(),
         val segSelected: Int = -1,
         val previewMags: FloatArray? = null, // shaping preview: per-point 0..1
         val previewHull: IntArray? = null, // shaping preview: convex-hull indices
         val previewN: Int = 9, // shaping preview grid size
-        val previewPos: FloatArray? = null // shaping preview: absolute [x,y] per point, [0,1], y down
+        val previewPos: FloatArray? = null, // shaping preview: absolute [x,y] per point, [0,1], y down
+        val dead: Boolean = false // rest zone: hover drains, never accumulates or fires
     ) {
         companion object {
             const val FOLDER = 0; const val VIDEO = 1; const val FILE = 2; const val ACTION = 3
@@ -133,6 +146,9 @@ class VrRenderer(
     private var inXZone = false
     private var xProgF = 0f
     private var xDwellFired = false
+    // Diagnostic: log once per latch episode when a completed dwell is
+    // suppressed by the fired latch (tells stuck-latch from no-dwell).
+    private var fireBlockedLogged = false
     fun tapSelect() { val h = highlight; if (h in browserRows.indices) onBrowserActivate(h, null) }
     fun moveHighlight(d: Int) {
         val n = browserRows.size
@@ -288,6 +304,12 @@ class VrRenderer(
     /** Play-menu gesture: look pitch (deg) that opens the menu. Positive =
      *  look up, negative = look down. Hysteresis 12°. */
     @Volatile var menuAngleDeg = 65f
+    /** Browser panel elevation (deg): 0 = centered at horizon (file
+     *  browsing), halfway to the play menu when floating over video. */
+    @Volatile var browserElevDeg: Float = 0f
+    /** Elevation for browser panels floating over live video: halfway
+     *  between center (horizon) and the play-menu panel. */
+    fun overlayElevDeg(): Float = menuElevDeg() / 2f
     /** True while the play menu is shown (VIDEO mode only). */
     @Volatile var menuOpen = false
     /** Transient in-VR message on the menu panel (Toasts are invisible
@@ -306,6 +328,8 @@ class VrRenderer(
     private var menuHighlight = -2 // -1 = seek bar, 0..10 buttons
     private var menuDwellFiredFor = -3
     private var menuHitValid = false
+    // hovered seek fraction (panel-wide u) for the live time tooltip; -1 = none
+    private var menuSeekHoverU = -1f
     private var menuHitW = FloatArray(3)
     /** Last panel hit, kept while the menu is open: the pointer tracks the
      *  gaze even mid-motion instead of flickering off. */
@@ -531,17 +555,19 @@ void main(){
     private var texFailCount = 0
 
     private fun drawFrameInner(gl: GL10?) {
-        // Consume UNCONDITIONALLY once any frame has ever arrived (VIDEO mode
-        // warms the queue within ~1s of start; before that stay flag-guarded
-        // so an empty queue never throws). Gating consumption on the flag
+        // Consume UNCONDITIONALLY once any frame has ever arrived (the queue
+        // warms within ~1s of start; before that stay flag-guarded so an
+        // empty queue never throws). Gating consumption on the flag
         // deadlocks permanently: if the producer ever gets a frame ahead
         // (ordinary jitter), its overflow replaces the queued frame SILENTLY
         // (no onFrameAvailable), the flag stays false forever, we never
         // consume, the queue never drains — frozen video, healthy audio,
         // zero errors, both decoders, varying 5-25s. Latching the same frame
         // an extra time is harmless; a stale slot is fatal. Never again.
+        // NOTE: no mode check here — panels float over LIVE video in
+        // BROWSER mode now, so the queue must keep draining there too.
         surfaceTexture?.let { st ->
-            if (frameAvailable || (mode == Mode.VIDEO && arrivedFrames > 0)) {
+            if (frameAvailable || arrivedFrames > 0) {
                 try { st.updateTexImage(); if (frameAvailable) consumedFrames++ } catch (e: Throwable) { texFailCount++; if (texFailCount <= 3 || texFailCount % 300 == 0) { android.util.Log.e("DomeVR-GL", "updateTexImage failed #$texFailCount", e); FileLog.e("DomeVR-GL", "updateTexImage failed #$texFailCount", e) } }
                 frameAvailable = false
             }
@@ -659,7 +685,7 @@ void main(){
             // screen-space pointer, re-warped to the displayed position:
             // project the world hit with this eye's rotation-only matrix
             if (cur == Mode.BROWSER && hitValid)
-                drawScreenPointer(hitX, hitY, -panelDistM, flatM, eyeAspect,
+                drawScreenPointer(hitX, hitY, hitZ, flatM, eyeAspect,
                     if (inXZone) xProgF.coerceIn(0f, 1f) else browserDwellProg())
         }
     }
@@ -814,15 +840,27 @@ void main(){
     }
 
     // ---------- gaze ----------
-    // Panel kept modest (~44° wide): a huge close panel swings wildly with
-    // head turns and keystones, which reads as "rotation".
-    private fun panelHalfW(): Float = panelDistM * 0.40f
+    // Panel size grows sub-linearly with distance (sqrt): distance changes
+    // stay clearly visible (nearer = bigger) while extremes stay comfortable.
+    // A linear width (= constant on-screen size) hid the control entirely.
+    // Matches stock 0.96 half-width at the 2.4 m default.
+    private fun panelHalfW(): Float = 0.62f * kotlin.math.sqrt(panelDistM)
     private fun panelHalfH(): Float = panelHalfW() * 0.62f
 
     // last ray↔panel hit in panel-world coords (for the at-depth cursor)
     private var hitX = 0f
     private var hitY = 0f
+    private var hitZ = -2.4f
     private var hitValid = false
+    // hovered slider fraction (panel-wide u) for the live tooltip; -1 = none
+    private var sliderHoverU = -1f
+    // gaze u where the last slider dwell fired; sliding the gaze along the
+    // bar re-arms shrink + fire without leaving the row (NaN = disarmed)
+    private var lastFiredU = Float.NaN
+    // head-forward at the last slider fire: re-arm requires the HEAD to have
+    // moved, so a panel resize shifting the mapping under a steady gaze
+    // can't trigger a spurious feedback-loop refire
+    private var lastFiredFwd = floatArrayOf(0f, 0f, -1f)
     // stillness gate state: dwell must NEVER fire while the head is moving,
     // or slow test turns sweep the gaze across rows and trigger accidental
     // navigation + recentering mid-turn (reads as rotation/pan glitches).
@@ -832,8 +870,8 @@ void main(){
 
     private fun updateGaze() {
         val rows = browserRows
-        if (rows.isEmpty()) { highlight = -1; hitValid = false; inXZone = false; xDwellFired = false; return }
-        if (now() < inputGraceUntil) { dwellStart = now(); return }
+        if (rows.isEmpty()) { highlight = -1; hitValid = false; inXZone = false; xDwellFired = false; sliderHoverU = -1f; lastFiredU = Float.NaN; return }
+        if (now() < inputGraceUntil) { dwellStart = now(); sliderHoverU = -1f; return }
         // Windowed stillness + leaky dwell (same as the play menu): jitter
         // and row churn only dent progress instead of zeroing the timer.
         val nowMs = now()
@@ -842,30 +880,48 @@ void main(){
         val dtMs = (nowMs - browProgT).coerceIn(0L, 500L)
         browProgT = nowMs
         if (!still) browProgF = maxOf(0f, browProgF - dtMs / 600f)
-        // head-forward ray in world (panel is axis-aligned at z=-D).
+        // head-forward ray in world (panel floats at browserElevDeg,
+        // facing the viewer; elevation 0 = centered at z=-D, identical math).
         // Uses the recentered orientation, so the reticle and the hover agree.
         val hm = FloatArray(16)
         synchronized(rawM) { computeEffLocked(rawM, hm) }
         val fx = -hm[2]; val fy = -hm[6]; val fz = -hm[10]
-        if (fz < -0.05f) {
-            val d = panelDistM
-            val t = d / -fz
-            val hx = fx * t; val hy = fy * t
+        val d = panelDistM
+        val el = Math.toRadians(browserElevDeg.toDouble()).toFloat()
+        val cx = 0f; val cy = (kotlin.math.sin(el) * d); val cz = (-kotlin.math.cos(el) * d)
+        var pnx = -cx; var pny = -cy; var pnz = -cz
+        val pnl = kotlin.math.sqrt(pnx * pnx + pny * pny + pnz * pnz).coerceAtLeast(1e-6f)
+        pnx /= pnl; pny /= pnl; pnz /= pnl
+        val denom = fx * pnx + fy * pny + fz * pnz
+        if (denom < -0.05f) {
+            val t = (cx * pnx + cy * pny + cz * pnz) / denom
+            val hx = fx * t; val hy = fy * t; val hz = fz * t
+            // panel coords: right = (1,0,0); up = n × right = (0, nz, -ny)
+            val upx = 0f; val upy = pnz; val upz = -pny
+            val upl = kotlin.math.sqrt(upy * upy + upz * upz).coerceAtLeast(1e-6f)
             val hw = panelHalfW(); val hh = panelHalfH()
-            if (hx >= -hw && hx <= hw && hy >= -hh && hy <= hh) {
-                hitX = hx; hitY = hy; hitValid = true
-                val u = (hx + hw) / (2 * hw)
-                val v = (hh - hy) / (2 * hh)
+            val alongRight = hx - cx
+            val alongUp = ((hx - cx) * upx + (hy - cy) * (upy / upl) + (hz - cz) * (upz / upl))
+            if (alongRight >= -hw && alongRight <= hw && alongUp >= -hh && alongUp <= hh) {
+                hitX = hx; hitY = hy; hitZ = hz; hitValid = true
+                val u = (alongRight + hw) / (2 * hw)
+                val v = (hh - alongUp) / (2 * hh)
                 // X close button: top-right title bar, above the rows.
                 if (u > 0.90f && v * TEX < ROWS_Y0) {
                     inXZone = true
+                    sliderHoverU = -1f
+                    lastFiredU = Float.NaN
+                    fireBlockedLogged = false
                     highlight = -1; dwellFiredFor = -2
                     browProgF = maxOf(0f, browProgF - dtMs / 600f)
-                    if (still) xProgF += dtMs / dwellMs.toFloat()
-                    else xProgF = maxOf(0f, xProgF - dtMs / 600f)
+                    if (!xDwellFired) {
+                        if (still) xProgF += dtMs / dwellMs.toFloat()
+                        else xProgF = maxOf(0f, xProgF - dtMs / 600f)
+                    }
                     if (still && !xDwellFired && xProgF >= 1f) {
                         xDwellFired = true
-                        xProgF = 0f
+                        xProgF = 1f
+                        FileLog.i("DomeVR-browser", "FIRE X close")
                         onBrowserActivate(-10, null)
                         return
                     }
@@ -877,31 +933,74 @@ void main(){
                 val vi = ((v * TEX - ROWS_Y0) / ROW_H).toInt()
                 if (vi in 0 until VISIBLE_ROWS) {
                     val idx = (scroll + vi).coerceIn(0, rows.size - 1)
+                    // dead rows are gaze rest zones: drain, never accumulate or fire
+                    if (rows[idx].dead) {
+                        if (idx != highlight) { highlight = idx; dwellFiredFor = -2 }
+                        sliderHoverU = -1f
+                        browProgF = maxOf(0f, browProgF - dtMs / 600f)
+                        return
+                    }
+                    sliderHoverU = if (rows[idx].slideKey != null || rows[idx].segActions.isNotEmpty()) u else -1f
                     if (idx != highlight) {
                         highlight = idx; dwellFiredFor = -2
+                        lastFiredU = Float.NaN
+                        fireBlockedLogged = false
                         // small credit on row change (replaces the old
                         // 150ms-style stability delay): keeps flips cheap
                         browProgF = minOf(browProgF, 0.25f)
                     }
-                    if (still) browProgF += dtMs / dwellMs.toFloat()
-                    else browProgF = maxOf(0f, browProgF - dtMs / 600f)
+                    // Slider re-arm: sliding the gaze along the bar after a
+                    // fire restarts shrink + fire without leaving the row.
+                    // Requires real head motion: a panel resize shifting the
+                    // mapping under a steady gaze must not refire by itself.
+                    // (Gaze is head-driven — no eye tracking — so any genuine
+                    // slide moves the head; jitter stays far below both gates.)
+                    if (highlight == dwellFiredFor && rows[idx].slideKey != null &&
+                        !lastFiredU.isNaN() && kotlin.math.abs(u - lastFiredU) > 0.05f &&
+                        angleDeg(lastFiredFwd, lastEffFwd) > 2f) {
+                        dwellFiredFor = -2
+                        browProgF = 0f
+                        lastFiredU = Float.NaN
+                    }
+                    // Accumulate only until fired for this hover; after firing
+                    // hold the shrunken state (no second shrink animation).
+                    // Re-entry (off-panel resets dwellFiredFor) restarts it.
+                    if (highlight != dwellFiredFor) {
+                        if (still) browProgF += dtMs / dwellMs.toFloat()
+                        else browProgF = maxOf(0f, browProgF - dtMs / 600f)
+                    }
                     if (still && highlight != dwellFiredFor && browProgF >= 1f) {
                         dwellFiredFor = highlight
-                        browProgF = 0f
-                        // slider rows pass the gaze fraction (u across the
-                        // panel) so one dwell sets any value; plain rows null
-                        val frac = if (rows[idx].slideKey != null) u else null
+                        browProgF = 1f
+                        // slider rows pass the bar-mapped fraction so one dwell
+                        // sets any value; segmented rows pass panel-wide u for
+                        // segment picking; plain rows null
+                        val frac = if (rows[idx].slideKey != null) barFrac(u)
+                            else if (rows[idx].segActions.isNotEmpty()) u else null
+                        if (rows[idx].slideKey != null) {
+                            lastFiredU = u
+                            lastFiredFwd = lastEffFwd.clone()
+                        }
+                        FileLog.i("DomeVR-browser", "FIRE row=$idx frac=$frac")
                         onBrowserActivate(highlight, frac)
                         return
+                    } else if (still && highlight == dwellFiredFor && browProgF >= 1f && !fireBlockedLogged) {
+                        fireBlockedLogged = true
+                        FileLog.i("DomeVR-browser", "BLOCKED repeat dwell row=$highlight prog=$browProgF")
                     }
                     return
                 }
             }
         }
-        // not hovering the panel: hide cursor, drain progress (no zeroing)
+        // not hovering the panel: hide cursor, drain progress (no zeroing).
+        // Reset the row-fired latch so looking back re-arms shrink + fire.
         hitValid = false
         inXZone = false
         xDwellFired = false
+        dwellFiredFor = -2
+        lastFiredU = Float.NaN
+        fireBlockedLogged = false
+        sliderHoverU = -1f
         xProgF = maxOf(0f, xProgF - 16f / 600f)
         browProgF = maxOf(0f, browProgF - 16f / 600f)
     }
@@ -913,6 +1012,18 @@ void main(){
     }
 
     private fun now() = System.currentTimeMillis()
+
+    /** Angle between two head-forward vectors, degrees. */
+    private fun angleDeg(a: FloatArray, b: FloatArray): Float {
+        val dot = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).coerceIn(-1f, 1f)
+        return Math.toDegrees(kotlin.math.acos(dot).toDouble()).toFloat()
+    }
+
+    /** Panel-wide gaze fraction -> slider-bar fraction (bar spans x 44..1000 of TEX 1024). */
+    private fun barFrac(u: Float) = ((u * TEX - 44f) / 956f).coerceIn(0f, 1f)
+
+    /** Panel-wide gaze fraction -> seek-bar fraction (bar spans x 24..1000 of 1024). */
+    private fun seekFrac(u: Float) = ((u * 1024f - 24f) / 976f).coerceIn(0f, 1f)
 
     // ---------- play menu ----------
     // World-locked panel floating up (or down) in the recentered frame.
@@ -1015,6 +1126,7 @@ void main(){
         if (!isUp) {
             menuOpen = false; menuHitValid = false; menuStickyValid = false
             menuHighlight = -2; menuDwellFiredFor = -3
+            menuSeekHoverU = -1f
             menuBelowSince = 0L
             if (menuWasOpen) FileLog.i("DomeVR-menu", "menu close")
             menuWasOpen = false
@@ -1067,6 +1179,7 @@ void main(){
                 val ub = (u - 1f / 6f) / (2f / 3f)
                 val id = if (v > 0.68f) -1 else if (ub < 0f || ub > 1f) -2
                     else (ub * MENU_BUTTONS).toInt().coerceIn(0, MENU_BUTTONS - 1)
+                menuSeekHoverU = if (id == -1) seekFrac(u) else -1f
                 // Leaky dwell: adopt immediately; progress grows while still
                 // on target and drains slowly otherwise. Churn and motion
                 // only dent progress instead of zeroing the timer.
@@ -1082,13 +1195,15 @@ void main(){
                 menuProgT = nowMs
                 for (i in menuProg.indices)
                     if (i != slot) menuProg[i] = maxOf(0f, menuProg[i] - dtMs / 600f)
-                // -2 = blank margin: hover shows the pointer, never fires
-                if (still && menuUsable(id)) menuProg[slot] += dtMs / dwellMs.toFloat()
+                // -2 = blank margin: hover shows the pointer, never fires.
+                // Hold shrunken state after firing; re-entry restarts it.
+                if (still && menuUsable(id) && menuHighlight != menuDwellFiredFor)
+                    menuProg[slot] += dtMs / dwellMs.toFloat()
                 if (still && menuUsable(id) && menuProg[slot] >= 1f && menuHighlight != menuDwellFiredFor) {
                     menuDwellFiredFor = menuHighlight
-                    menuProg[slot] = 0f
+                    menuProg[slot] = 1f
                     FileLog.i("DomeVR-menu", "FIRE id=$id")
-                    if (id == -1) onMenuEvent(MenuEvent.Seek(u)) else onMenuEvent(MenuEvent.Press(id))
+                    if (id == -1) onMenuEvent(MenuEvent.Seek(seekFrac(u))) else onMenuEvent(MenuEvent.Press(id))
                     return
                 }
                 return
@@ -1100,6 +1215,7 @@ void main(){
         if (menuHitValid)
             FileLog.i("DomeVR-menu", "left panel (was id=$menuHighlight)")
         menuHitValid = false
+        menuSeekHoverU = -1f
         if (menuHighlight != -2) {
             menuHighlight = -2; menuDwellFiredFor = -3
         }
@@ -1175,18 +1291,32 @@ void main(){
 
     private var browserGrid: Mesh? = null
     private var browserGridD = -1f
+    private var browserGridEl = -999f
     private fun drawBrowser(warpCx: Float, aspect: Float) {
         maybeUploadBrowser()
         val d = panelDistM; val hw = panelHalfW(); val hh = panelHalfH()
         // rotation-only UI matrix: identical in both eyes, always fuses.
         // Grid cached: rebuilding it per frame churned direct buffers and
-        // strobed the whole scene through GC.
-        if (browserGrid == null || browserGridD != d) {
-            browserGrid = gridQuadP(
-                floatArrayOf(-hw, hh, -d), floatArrayOf(hw, hh, -d),
-                floatArrayOf(-hw, -hh, -d), floatArrayOf(hw, -hh, -d), 12, 8
+        // strobed the whole scene through GC. Panel floats at browserElevDeg
+        // (0 = centered; elevated = below the play menu, facing viewer).
+        val el = Math.toRadians(browserElevDeg.toDouble()).toFloat()
+        if (browserGrid == null || browserGridD != d || browserGridEl != el) {
+            val cx = 0f; val cy = (kotlin.math.sin(el) * d); val cz = (-kotlin.math.cos(el) * d)
+            var nx = -cx; var ny = -cy; var nz = -cz
+            val nl = kotlin.math.sqrt(nx * nx + ny * ny + nz * nz).coerceAtLeast(1e-6f)
+            nx /= nl; ny /= nl; nz /= nl
+            // up = n × (1,0,0) = (0, nz, -ny)
+            val ux = 0f; val uy = nz; val uz = -ny
+            fun corner(sx: Float, sy: Float) = floatArrayOf(
+                cx + sx * hw + ux * sy * hh,
+                cy + uy * sy * hh,
+                cz + uz * sy * hh
             )
-            browserGridD = d
+            browserGrid = gridQuadP(
+                corner(-1f, 1f), corner(1f, 1f), corner(-1f, -1f), corner(1f, -1f), 12, 8
+            )
+            browserGridD = d; browserGridEl = el
+            FileLog.i("DomeVR-browser", "grid rebuild d=$d el=$el")
         }
         drawMesh2d(browserGrid!!, browserTexId, flatM, warpCx, aspect)
     }
@@ -1289,7 +1419,8 @@ void main(){
                 h = h * 31 + (rows[i].previewHull?.size ?: 0)
             }
         }
-        h = h * 31 + highlight + (if (inXZone) 1009 else 0)
+        h = h * 31 + highlight + (if (inXZone) 1009 else 0) +
+            (if (sliderHoverU >= 0f) (sliderHoverU * 128).toInt() else 0)
         if (h == lastPanelHash && browserBitmap != null) return
         lastPanelHash = h
         val bmp = Bitmap.createBitmap(TEX, TEX, Bitmap.Config.ARGB_8888)
@@ -1324,6 +1455,10 @@ void main(){
                     p.color = Color.rgb(148, 163, 184); p.textSize = 20f
                     c.drawText(r.meta.take(40), 100f, (y + 58).toFloat(), p)
                 }
+            } else if (r.dead) {
+                // rest zone: thin divider, nothing to activate
+                p.color = Color.rgb(51, 65, 85)
+                c.drawRect(44f, (y + ROW_H / 2 - 1).toFloat(), 1000f, (y + ROW_H / 2 + 1).toFloat(), p)
             } else if (r.segLabels.isNotEmpty()) {
                 // segmented button row: N equal buttons across the row width
                 val n = r.segLabels.size
@@ -1344,27 +1479,75 @@ void main(){
                     }
                     c.drawText(r.segLabels[s].take(12), (sx0 + sx1) / 2f, (y + 41).toFloat(), p)
                 }
+                // live tooltip: name of the segment the gaze would select
+                if (i == highlight && sliderHoverU >= 0f) {
+                    val fx = ((sliderHoverU * 1024f - 20f) / 984f).coerceIn(0f, 0.999f)
+                    val seg = (fx * n).toInt().coerceIn(0, n - 1)
+                    val txt = r.segLabels[seg].take(12)
+                    val cx = x0 + (seg + 0.5f) * bw
+                    p.textSize = 20f
+                    val tw = p.measureText(txt)
+                    val bx0 = (cx - tw / 2f - 10f).coerceAtLeast(24f)
+                    val bx1 = (cx + tw / 2f + 10f).coerceAtMost(1000f)
+                    p.color = Color.rgb(10, 14, 22)
+                    c.drawRect(bx0, (y + 18).toFloat(), bx1, (y + 46).toFloat(), p)
+                    p.color = Color.WHITE
+                    p.style = Paint.Style.STROKE; p.strokeWidth = 3f
+                    c.drawRect(bx0, (y + 18).toFloat(), bx1, (y + 46).toFloat(), p)
+                    p.style = Paint.Style.FILL
+                    c.drawText(txt, (bx0 + bx1) / 2f, (y + 39).toFloat(), p)
+                }
                 p.textAlign = Paint.Align.LEFT
             } else {
-            val icon = when (r.kind) {
-                BrowserRow.FOLDER -> "📁"
-                BrowserRow.VIDEO -> "🎬"
-                BrowserRow.ACTION -> "⚙"
-                else -> "📄"
+            if (r.slideKey == null) {
+                val icon = when (r.kind) {
+                    BrowserRow.FOLDER -> "📁"
+                    BrowserRow.VIDEO -> "🎬"
+                    BrowserRow.ACTION -> "⚙"
+                    else -> "📄"
+                }
+                p.color = Color.WHITE; p.textSize = 36f
+                c.drawText("$icon  ${r.label.take(30)}", 44f, (y + 34).toFloat(), p)
             }
-            p.color = Color.WHITE; p.textSize = 36f
-            c.drawText("$icon  ${r.label.take(30)}", 44f, (y + 34).toFloat(), p)
             if (r.slideKey != null) {
-                // gaze slider: value text + full-width bar; dwelling at
-                // any horizontal position sets that value directly
+                // gaze slider (compact): label + value on top line, bar
+                // mid-row, live tooltip bubble below the bar at the gaze
+                // position showing the value a dwell would select
                 val frac = ((r.slideVal - r.slideMin) / (r.slideMax - r.slideMin)).coerceIn(0f, 1f)
-                p.color = Color.rgb(125, 211, 252); p.textSize = 24f; p.textAlign = Paint.Align.RIGHT
-                c.drawText(r.meta.take(20), 1000f, (y + 30).toFloat(), p)
+                p.color = Color.WHITE; p.textSize = 28f
+                c.drawText(r.label.take(30), 44f, (y + 26).toFloat(), p)
+                p.color = Color.rgb(125, 211, 252); p.textSize = 20f; p.textAlign = Paint.Align.RIGHT
+                c.drawText(r.meta.take(20), 1000f, (y + 26).toFloat(), p)
                 p.textAlign = Paint.Align.LEFT
                 p.color = Color.rgb(51, 65, 85)
-                c.drawRect(44f, (y + 40).toFloat(), 1000f, (y + 56).toFloat(), p)
+                c.drawRect(44f, (y + 30).toFloat(), 1000f, (y + 42).toFloat(), p)
                 p.color = Color.rgb(125, 211, 252)
-                c.drawRect(44f, (y + 40).toFloat(), 44f + 956f * frac, (y + 56).toFloat(), p)
+                c.drawRect(44f, (y + 30).toFloat(), 44f + 956f * frac, (y + 42).toFloat(), p)
+                if (i == highlight && sliderHoverU >= 0f) {
+                    val hf = barFrac(sliderHoverU)
+                    var rraw = r.slideMin + hf * (r.slideMax - r.slideMin)
+                    val fm = r.slideFmt
+                    if (fm != null && fm.snap > 0f) rraw = Math.round(rraw / fm.snap).toFloat() * fm.snap
+                    val disp = rraw * (fm?.scale ?: 1f) + (fm?.offset ?: 0f)
+                    val dec = fm?.decimals ?: 0
+                    val num = if (dec == 0) Math.round(disp).toString()
+                        else String.format(Locale.US, "%.${dec}f", disp)
+                    val txt = num + (fm?.suffix ?: "")
+                    val tx = (44f + hf * 956f).coerceIn(70f, 954f)
+                    p.textSize = 16f; p.textAlign = Paint.Align.CENTER
+                    val tw = p.measureText(txt)
+                    val bx0 = (tx - tw / 2f - 10f).coerceAtLeast(24f)
+                    val bx1 = (tx + tw / 2f + 10f).coerceAtMost(1000f)
+                    p.color = Color.rgb(10, 14, 22)
+                    c.drawRect(bx0, (y + 44).toFloat(), bx1, (y + 62).toFloat(), p)
+                    p.color = Color.rgb(125, 211, 252)
+                    p.style = Paint.Style.STROKE; p.strokeWidth = 2f
+                    c.drawRect(bx0, (y + 44).toFloat(), bx1, (y + 62).toFloat(), p)
+                    p.style = Paint.Style.FILL
+                    p.color = Color.WHITE
+                    c.drawText(txt, (bx0 + bx1) / 2f, (y + 58).toFloat(), p)
+                    p.textAlign = Paint.Align.LEFT
+                }
             } else if (r.meta.isNotEmpty()) {
                 p.color = Color.rgb(148, 163, 184); p.textSize = 24f
                 c.drawText("    ${r.meta.take(56)}", 44f, (y + 58).toFloat(), p)
@@ -1421,7 +1604,8 @@ void main(){
         val durSec = (menuDurMs / 1000).toInt()
         val flashing = menuFlash.isNotEmpty() && now() < menuFlashUntil
         val h = menuHighlight * 31 + posSec * 131 + durSec * 17 +
-            (if (menuPlaying) 1 else 0) + (if (flashing) 1009 else 0) + menuFlash.hashCode()
+            (if (menuPlaying) 1 else 0) + (if (flashing) 1009 else 0) + menuFlash.hashCode() +
+            (if (menuSeekHoverU >= 0f) (menuSeekHoverU * 128).toInt() else 0)
         if (h == lastMenuHash && menuBitmap != null) return
         lastMenuHash = h
         val W = 1024; val H = 288
@@ -1454,8 +1638,28 @@ void main(){
             c.drawRect(24f, 208f, (W - 24).toFloat(), 240f, p)
             p.style = Paint.Style.FILL
         }
+        // live tooltip: time the current gaze position would seek to,
+        // just below the bar
+        if (menuHighlight == -1 && menuSeekHoverU >= 0f && menuDurMs > 0) {
+            val hf = menuSeekHoverU.coerceIn(0f, 1f)
+            val txt = fmtTime((hf * menuDurMs).toLong())
+            val tx = (24f + hf * (W - 48)).coerceIn(70f, (W - 70).toFloat())
+            p.textSize = 15f; p.textAlign = Paint.Align.CENTER
+            val tw = p.measureText(txt)
+            val bx0 = (tx - tw / 2f - 10f).coerceAtLeast(8f)
+            val bx1 = (tx + tw / 2f + 10f).coerceAtMost((W - 8).toFloat())
+            p.color = Color.rgb(10, 14, 22)
+            c.drawRect(bx0, 242f, bx1, 264f, p)
+            p.color = Color.rgb(125, 211, 252)
+            p.style = Paint.Style.STROKE; p.strokeWidth = 2f
+            c.drawRect(bx0, 242f, bx1, 264f, p)
+            p.style = Paint.Style.FILL
+            p.color = Color.WHITE
+            c.drawText(txt, (bx0 + bx1) / 2f, 259f, p)
+            p.textAlign = Paint.Align.LEFT
+        }
         p.color = Color.WHITE; p.textSize = 16f; p.textAlign = Paint.Align.CENTER
-        c.drawText(if (flashing) menuFlash else "${fmtTime(menuPosMs)} / ${fmtTime(menuDurMs)}", W / 2f, 276f, p)
+        c.drawText(if (flashing) menuFlash else "${fmtTime(menuPosMs)} / ${fmtTime(menuDurMs)}", W / 2f, 280f, p)
         p.textAlign = Paint.Align.LEFT
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, menuTexId)
         GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)

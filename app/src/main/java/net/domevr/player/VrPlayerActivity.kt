@@ -82,13 +82,15 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         val action: String? = null, // for settings rows
         val slideKey: String? = null, // gaze slider id (settings rows)
         val slideMin: Float = 0f, val slideMax: Float = 1f, val slideVal: Float = 0f,
+        val slideFmt: VrRenderer.SlideFormat? = null,
         val segLabels: List<String> = emptyList(), // segmented button row labels
         val segActions: List<String> = emptyList(), // one action per segment
         val segSelected: Int = -1, // currently active segment
         val previewMags: FloatArray? = null, // shaping preview: per-point magnitude 0..1
         val previewHull: IntArray? = null, // shaping preview: convex-hull point indices
         val previewN: Int = 9, // shaping preview grid size (n x n)
-        val previewPos: FloatArray? = null // shaping preview: absolute [x,y] per point, [0,1], y down
+        val previewPos: FloatArray? = null, // shaping preview: absolute [x,y] per point, [0,1], y down
+        val dead: Boolean = false // rest zone: gaze may park here, nothing fires
     )
 
     /** Absolute preview positions from offsets: nominal + offset, y down. */
@@ -653,6 +655,9 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun refresh() {
+        // Browser panel floats over live video halfway to the play menu
+        // when a video exists; centered at horizon otherwise.
+        renderer.browserElevDeg = if (player != null) renderer.overlayElevDeg() else 0f
         when (val l = loc) {
             is Loc.Root -> showRoot()
             is Loc.Smb -> showSmb(l.connId, l.path)
@@ -667,9 +672,9 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         rows = r
         renderer.browserTitle = title
         renderer.browserRows = r.map {
-            VrRenderer.BrowserRow(it.label, it.meta, it.kind, it.slideKey, it.slideMin, it.slideMax, it.slideVal,
+            VrRenderer.BrowserRow(it.label, it.meta, it.kind, it.slideKey, it.slideMin, it.slideMax, it.slideVal, it.slideFmt,
                 it.segLabels, it.segActions, it.segSelected,
-                it.previewMags, it.previewHull, it.previewN, it.previewPos)
+                it.previewMags, it.previewHull, it.previewN, it.previewPos, it.dead)
         }
         txtStatus.text = status
     }
@@ -746,9 +751,11 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
 
     private fun showSettings() {
         // gaze sliders: dwell anywhere on the bar to jump straight there
-        fun slide(label: String, value: String, key: String, min: Float, max: Float, cur: Float) =
+        fun slide(label: String, value: String, key: String, min: Float, max: Float, cur: Float,
+                  fmt: VrRenderer.SlideFormat = VrRenderer.SlideFormat()) =
             Row(label, value, VrRenderer.BrowserRow.ACTION,
-                action = "slide:$key", slideKey = key, slideMin = min, slideMax = max, slideVal = cur)
+                action = "slide:$key", slideKey = key, slideMin = min, slideMax = max, slideVal = cur,
+                slideFmt = fmt)
         val r = mutableListOf(
             Row("Video", renderer.stereo.label, VrRenderer.BrowserRow.ACTION,
                 segLabels = listOf("2D", "SBS", "OU"),
@@ -762,13 +769,21 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 segLabels = listOf("Normal", "Fisheye"),
                 segActions = listOf("setlens:normal", "setlens:fisheye"),
                 segSelected = if (renderer.projection == Projection.FISHEYE) 1 else 0),
-            slide("Field of view", "${settings.fovDeg.toInt()}°", "fov", 40f, 110f, settings.fovDeg),
-            slide("Video size", "${String.format("%.2f", settings.videoZoom)}×", "zoom", 0.3f, 2.5f, settings.videoZoom),
-            slide("Dome stretch onset", "${((0.5f - settings.domeOnset) * 100).toInt()}% from edge", "domeOnset", 0f, 0.45f, settings.domeOnset),
-            slide("Dome stretch strength", "${(settings.domeStretchK * 100).toInt()}%", "domeStretch", 0f, 3f, settings.domeStretchK),
-            slide("Eye separation", "${settings.ipdMm.toInt()} mm", "ipd", 40f, 80f, settings.ipdMm),
-            slide("Panel distance", "${String.format("%.1f", settings.panelDistM)} m", "panel", 1.2f, 5f, settings.panelDistM),
-            slide("Gaze delay", "${settings.dwellMs} ms", "dwell", 400f, 4000f, settings.dwellMs.toFloat()),
+            slide("Field of view", "${settings.fovDeg.toInt()}°", "fov", 40f, 110f, settings.fovDeg,
+                VrRenderer.SlideFormat("°", 0, 1f, 0f, 1f)),
+            slide("Video size", "${String.format("%.2f", settings.videoZoom)}×", "zoom", 0.3f, 2.5f, settings.videoZoom,
+                VrRenderer.SlideFormat("×", 2, 1f, 0f, 0.05f)),
+            slide("Edge stretch onset", "${((0.5f - settings.domeOnset) * 100).toInt()}% from edge", "domeOnset", 0f, 0.45f, settings.domeOnset,
+                VrRenderer.SlideFormat("% from edge", 0, -100f, 50f, 0.01f)),
+            slide("Edge stretch strength", "${(settings.domeStretchK * 100).toInt()}%", "domeStretch", 0f, 3f, settings.domeStretchK,
+                VrRenderer.SlideFormat("%", 0, 100f, 0f, 0.01f)),
+            Row("", "", VrRenderer.BrowserRow.FILE, dead = true),
+            slide("Eye separation", "${settings.ipdMm.toInt()} mm", "ipd", 40f, 80f, settings.ipdMm,
+                VrRenderer.SlideFormat(" mm", 0, 1f, 0f, 1f)),
+            slide("Panel distance", "${String.format("%.1f", settings.panelDistM)} m", "panel", 1.2f, 5f, settings.panelDistM,
+                VrRenderer.SlideFormat(" m", 1, 1f, 0f, 0.1f)),
+            slide("Gaze delay", "${settings.dwellMs} ms", "dwell", 400f, 4000f, settings.dwellMs.toFloat(),
+                VrRenderer.SlideFormat(" ms", 0, 1f, 0f, 100f)),
             Row("Swap eyes", if (settings.swapEyes) "ON" else "off", VrRenderer.BrowserRow.ACTION, action = "set:swap"),
             Row("Pin video in front", if (settings.pinVideo) "ON (no look-around)" else "off (look-around)",
                 VrRenderer.BrowserRow.ACTION, action = "set:pin"),
@@ -777,9 +792,11 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun showShaping() {
-        fun slide(label: String, value: String, key: String, min: Float, max: Float, cur: Float) =
+        fun slide(label: String, value: String, key: String, min: Float, max: Float, cur: Float,
+                  fmt: VrRenderer.SlideFormat = VrRenderer.SlideFormat()) =
             Row(label, value, VrRenderer.BrowserRow.ACTION,
-                action = "slide:$key", slideKey = key, slideMin = min, slideMax = max, slideVal = cur)
+                action = "slide:$key", slideKey = key, slideMin = min, slideMax = max, slideVal = cur,
+                slideFmt = fmt)
         val r = mutableListOf<Row>()
         // Combined preview of the averaged transform (first row, not actionable).
         val avg = averagedShapeOffsets()
@@ -805,7 +822,8 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 VrRenderer.BrowserRow.ACTION, action = "toggleshape:${s.id}",
                 previewMags = s.mags, previewHull = s.hull, previewN = s.n,
                 previewPos = previewPos(s.ox, s.oy, s.n))
-            r += slide("${s.label} weight", "${w.toInt()}%", "shapeWeight-${s.id}", 0f, 100f, w)
+            r += slide("${s.label} weight", "${w.toInt()}%", "shapeWeight-${s.id}", 0f, 100f, w,
+                VrRenderer.SlideFormat("%", 0, 1f, 0f, 1f))
         }
         pushRows("Shaping", "dwell a shape to toggle • dwell a bar to set weight", r)
     }
@@ -922,6 +940,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             // frac spans the full panel; buttons span x 20..1004 of TEX 1024
             val fx = ((frac * 1024f - 20f) / 984f).coerceIn(0f, 0.999f)
             val seg = (fx * row.segActions.size).toInt().coerceIn(0, row.segActions.size - 1)
+            FileLog.i("DomeVR-browser", "seg fire: row=${row.label} seg=$seg action=${row.segActions[seg]}")
             handleAction(row.segActions[seg]); return
         }
         // gaze slider: one dwell at fraction u sets the value directly
@@ -949,13 +968,14 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
      *  snapped to its grid. One dwell reaches any value. */
     private fun handleSlide(key: String, frac: Float) {
         val f = frac.coerceIn(0f, 1f)
+        FileLog.i("DomeVR-browser", "slide key=$key frac=$f")
         when (key) {
             "fov" -> settings.fovDeg = (40f + f * 70f).roundToInt().toFloat().coerceIn(40f, 110f)
             "zoom" -> settings.videoZoom = ((0.3f + f * 2.2f) * 20f).roundToInt() / 20f
             "ipd" -> settings.ipdMm = (40f + f * 40f).roundToInt().toFloat().coerceIn(40f, 80f)
             "panel" -> settings.panelDistM = ((1.2f + f * 3.8f) * 10f).roundToInt() / 10f
             "domeOnset" -> settings.domeOnset = ((f * 0.45f) * 100f).roundToInt() / 100f
-            "domeStretch" -> settings.domeStretchK = ((f * 3f) * 20f).roundToInt() / 20f
+            "domeStretch" -> settings.domeStretchK = ((f * 3f) * 100f).roundToInt() / 100f
             "dwell" -> settings.dwellMs = ((400f + f * 3600f) / 100f).roundToInt() * 100L
             else -> {
                 // per-shape weight sliders: slideKey "shapeWeight-<slug>"
