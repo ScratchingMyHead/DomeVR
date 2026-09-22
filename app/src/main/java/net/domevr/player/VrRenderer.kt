@@ -301,9 +301,20 @@ class VrRenderer(
      *  >0 pulls both image centers toward the middle (for narrow IPD).
      *  Computed in applyOptics as (1 - ipd/spacing). */
     @Volatile var convShiftNdc = 0f
-    /** Play-menu gesture: look pitch (deg) that opens the menu. Positive =
-     *  look up, negative = look down. Hysteresis 12°. */
-    @Volatile var menuAngleDeg = 65f
+    /** Play-menu trigger tilts: up opens the top menu, down the bottom menu. */
+    @Volatile var menuAngleUp = 40f
+    @Volatile var menuAngleDown = -40f
+    /** Which side the play menu lives on; flipped by its ⇅ button (persisted). */
+    @Volatile var menuSideUp = true
+    @Volatile private var menuAnimFrom = 52f
+    @Volatile private var menuAnimT0 = 0L
+    private val menuAnimMs = 350L
+    /** Flip top<->bottom with a quick visible sweep through the middle. */
+    fun menuToggleSide() {
+        menuAnimFrom = menuElevCurrent()
+        menuSideUp = !menuSideUp
+        menuAnimT0 = now()
+    }
     /** Browser panel elevation (deg): 0 = centered at horizon (file
      *  browsing), halfway to the play menu when floating over video. */
     @Volatile var browserElevDeg: Float = 0f
@@ -319,11 +330,72 @@ class VrRenderer(
     fun flashMenu(msg: String, ms: Long = 2000L) {
         menuFlash = msg
         menuFlashUntil = System.currentTimeMillis() + ms
+        showToast(msg, ms)
+    }
+    /** Center-screen 3D toast (Android Toasts are unreadable in-headset):
+     *  head-locked quad in the vertical middle, auto-expiring. */
+    @Volatile var toastText = ""
+    @Volatile var toastUntil = 0L
+    fun showToast(msg: String, ms: Long = 2500L) {
+        toastText = msg
+        toastUntil = System.currentTimeMillis() + ms
+    }
+    private var toastTexId = 0
+    private var lastToastText = ""
+    private var lastToastActive = false
+    private val toastVerts: FloatBuffer = ByteBuffer.allocateDirect(12 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+    private val toastTex: FloatBuffer = ByteBuffer.allocateDirect(8 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+    private fun maybeUploadToast() {
+        val active = toastText.isNotEmpty() && now() < toastUntil
+        if (active == lastToastActive && toastText == lastToastText && toastBitmap != null) return
+        lastToastActive = active
+        lastToastText = toastText
+        val W = 512; val H = 112
+        val bmp = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+        c.drawColor(Color.TRANSPARENT)
+        if (active) {
+            val p = Paint(Paint.ANTI_ALIAS_FLAG)
+            p.color = Color.argb(220, 10, 14, 22)
+            c.drawRoundRect(4f, 4f, (W - 4).toFloat(), (H - 4).toFloat(), 24f, 24f, p)
+            p.color = Color.WHITE; p.textSize = 40f; p.textAlign = Paint.Align.CENTER
+            c.drawText(toastText.take(34), W / 2f, 70f, p)
+            p.textAlign = Paint.Align.LEFT
+        }
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, toastTexId)
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+        toastBitmap?.recycle()
+        toastBitmap = bmp
+    }
+    private var toastBitmap: Bitmap? = null
+    /** Screen-space toast quad at the vertical middle, drawn after the
+     *  panels/pointer like the reticle (prog2d + identM, warp off). */
+    private fun drawToast() {
+        maybeUploadToast()
+        if (toastText.isEmpty() || now() >= toastUntil) return
+        putQuad(toastVerts, toastTex, -0.62f, -0.14f, 0.62f, 0.14f)
+        GLES20.glUseProgram(prog2d)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, toastTexId)
+        GLES20.glUniform1i(uTex2d, 0)
+        GLES20.glUniformMatrix4fv(uMvp2d, 1, false, identM, 0)
+        GLES20.glUniform1f(uWarpOn2d, 0f)
+        GLES20.glEnableVertexAttribArray(aPos2d)
+        GLES20.glVertexAttribPointer(aPos2d, 3, GLES20.GL_FLOAT, false, 0, toastVerts)
+        GLES20.glEnableVertexAttribArray(aTex2d)
+        GLES20.glVertexAttribPointer(aTex2d, 2, GLES20.GL_FLOAT, false, 0, toastTex)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        GLES20.glDisableVertexAttribArray(aPos2d)
+        GLES20.glDisableVertexAttribArray(aTex2d)
     }
     /** Playback position/duration/state for the menu progress bar. */
     @Volatile var menuPosMs = 0L
     @Volatile var menuDurMs = 0L
     @Volatile var menuPlaying = true
+    /** File name shown across the top of the play menu. */
+    @Volatile var menuTitle = ""
+    /** Rewind/fast-forward jump, seconds (2D setting). */
+    @Volatile var skipSecs = 10
     // menu gaze state (GL thread)
     private var menuHighlight = -2 // -1 = seek bar, 0..10 buttons
     private var menuDwellFiredFor = -3
@@ -380,8 +452,8 @@ class VrRenderer(
     @Volatile var lastHeight = 1
 
     companion object {
-        const val VISIBLE_ROWS = 12
-        const val MENU_BUTTONS = 12
+        const val VISIBLE_ROWS = 13
+        const val MENU_BUTTONS = 13
         const val TEX = 1024
         const val ROWS_Y0 = 150
         const val ROW_H = 64
@@ -425,7 +497,7 @@ void main(){
   if (uStereo == 1) { t.x = (t.x + float(uEye)) * 0.5; }
   else if (uStereo == 2) { t.y = (t.y + float(uEye)) * 0.5; }
   // zoom crops the picture, not the frustum: magnify content about the
-  // half-image center (each SBS/OU half is its own picture). Outside the
+  // half-image center (each SBS/TB half is its own picture). Outside the
   // frame paints black (shrunken screen on flat, void on domes). Unlike
   // FOV zoom this never distorts perspective, at any value.
   vec2 c = vec2(0.5);
@@ -534,6 +606,12 @@ void main(){
         GLES20.glGenTextures(1, tex, 0)
         menuTexId = tex[0]
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, menuTexId)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+
+        GLES20.glGenTextures(1, tex, 0)
+        toastTexId = tex[0]
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, toastTexId)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
     }
@@ -687,6 +765,7 @@ void main(){
             if (cur == Mode.BROWSER && hitValid)
                 drawScreenPointer(hitX, hitY, hitZ, flatM, eyeAspect,
                     if (inXZone) xProgF.coerceIn(0f, 1f) else browserDwellProg())
+            drawToast()
         }
     }
 
@@ -1027,7 +1106,7 @@ void main(){
 
     // ---------- play menu ----------
     // World-locked panel floating up (or down) in the recentered frame.
-    // Look up past menuAngleDeg to open, back down (8° hysteresis) to hide.
+    // Look past the side's trigger angle to open; the close band sits 25° lower.
     // The pointer stays hidden during video until the menu opens.
     /** Windowed stillness gate: displacement over the trailing ~250ms.
      *  Per-frame deltas are useless — game-RV jitter trips a per-frame
@@ -1066,22 +1145,52 @@ void main(){
     // leaky dwell integrators: progress grows while still on target and
     // drains slowly otherwise. Resets can never win against tremor or
     // target churn — flicker only dents progress instead of zeroing it.
-    private val menuProg = FloatArray(13)
+    private val menuProg = FloatArray(14)
     private var menuProgT = 0L
     private var browProgF = 0f
     private var browProgT = 0L
-    private fun menuSlot(id: Int) = if (id == -1) 12 else id
+    private fun menuSlot(id: Int) = if (id == -1) 13 else id
     private fun menuUsable(id: Int) = id != -2
+    // Play-menu column geometry shared by drawing + hit-testing: 11 columns
+    // across the middle 5/6, with wider empty gaps (no divider lines) after
+    // transport (7), zoom (8) and volume (9). menuColXs[c] = left edge of col c.
+    private val menuColXs: FloatArray by lazy {
+        val W = 1024f
+        val gap = 20f
+        val bw = (W * 5f / 6f - 3f * gap) / 11f
+        val xs = FloatArray(12)
+        var x = W / 12f
+        for (c in 0..11) {
+            xs[c] = x
+            if (c < 11) {
+                x += bw
+                if (c == 7 || c == 8 || c == 9) x += gap
+            }
+        }
+        xs
+    }
 
-    /** Effective open angle (always 30..85) and side derived from the sign. */
-    private fun menuOpenAngle(): Float = kotlin.math.abs(menuAngleDeg).coerceIn(30f, 85f)
-    private fun menuIsBelow(): Boolean = menuAngleDeg < 0f
+    /** Effective open angle (always 10..60) and side from the ⇅ toggle. */
+    private fun menuOpenAngle(): Float =
+        if (menuSideUp) menuAngleUp.coerceIn(10f, 60f)
+        else kotlin.math.abs(menuAngleDown).coerceIn(10f, 60f)
+    private fun menuIsBelow(): Boolean = !menuSideUp
     /** Menu panel elevation: the whole panel floats above the open angle
      *  (center = angle + 12°, half-height ~10°), so looking at any button
      *  keeps you above the trigger. No hysteresis anywhere: open at/above
      *  the angle, closed below it. */
     private fun menuElevDeg(): Float =
         ((menuOpenAngle() + 12f).coerceAtMost(85f)) * (if (menuIsBelow()) -1f else 1f)
+    /** Animated elevation for the ⇅ flip: smooth sweep through the middle,
+     *  settling on the target side. */
+    fun menuElevCurrent(): Float {
+        val target = menuElevDeg()
+        val dt = now() - menuAnimT0
+        if (dt >= menuAnimMs) return target
+        val t = (dt.toFloat() / menuAnimMs).coerceIn(0f, 1f)
+        val s = t * t * (3f - 2f * t)
+        return menuAnimFrom + (target - menuAnimFrom) * s
+    }
     private fun menuHalfW(): Float = panelDistM * 0.465f
     private fun menuHalfH(): Float = menuHalfW() * 0.20f
 
@@ -1101,15 +1210,16 @@ void main(){
         val tilt = Math.toDegrees(kotlin.math.atan2(up[2].toDouble(), up[1].toDouble())).toFloat()
         val ang = menuOpenAngle()
         val below = menuIsBelow()
-        // Open exactly at the angle; close 25° lower. The band is load-
-        // bearing, not hysteresis-for-comfort: reaching the panel ends
-        // dips the tilt reading ~15-20° (head-yaw cone geometry), so an
-        // exact close threshold strobes the menu (and every dwell) while
-        // operating the end buttons. Opening is still exact at the angle.
+        // Open exactly at the angle; close ~4.2° lower (a third of the
+        // original 12.5°). The band is load-bearing, not hysteresis-
+        // for-comfort: reaching the panel ends dips the tilt reading
+        // ~15-20° (head-yaw cone geometry), so too tight a close
+        // threshold strobes the menu (and every dwell) while operating
+        // the end buttons. Opening is still exact at the angle.
         // Closing additionally needs 400ms continuously below, killing
         // sensor-noise flapping at the boundary.
         val openAt = ang
-        val closeAt = (ang - 25f).coerceAtLeast(15f)
+        val closeAt = (ang - 12.5f / 3f).coerceAtLeast(2.5f)
         val above = if (!below) tilt >= (if (!menuOpen) openAt else closeAt)
             else tilt <= -(if (!menuOpen) openAt else closeAt)
         val isUp: Boolean
@@ -1148,10 +1258,11 @@ void main(){
         synchronized(rawM) { still = menuStill.update(rawM, nowMs) }
         // fixed world-locked panel (no yaw following): center straight up
         // in the recentered frame, facing the viewer. The bar is 1.5x the
-        // button row: buttons live in the middle 2/3, blank 1/6 margins
+        // button row: buttons live in the middle 5/6, blank 1/12 margins
         // either side are dead zones (highlight -2, no fire).
+        // Uses the animated elevation so the pointer tracks the ⇅ flip.
         val d = panelDistM
-        val el = Math.toRadians(menuElevDeg().toDouble()).toFloat()
+        val el = Math.toRadians(menuElevCurrent().toDouble()).toFloat()
         val cx = 0f; val cy = (kotlin.math.sin(el) * d); val cz = (-kotlin.math.cos(el) * d)
         // normal toward viewer
         var nx = -cx; var ny = -cy; var nz = -cz
@@ -1176,9 +1287,26 @@ void main(){
             if (u >= 0f && u <= 1f && v >= 0f && v <= 1f) {
                 menuHitValid = true
                 menuHitW = floatArrayOf(hx, hy, hz)
-                val ub = (u - 1f / 6f) / (2f / 3f)
+                val ub = (u - 1f / 12f) / (5f / 6f)
                 val id = if (v > 0.68f) -1 else if (ub < 0f || ub > 1f) -2
-                    else (ub * MENU_BUTTONS).toInt().coerceIn(0, MENU_BUTTONS - 1)
+                    else {
+                        // column from the shared menuColXs geometry (gaps
+                        // between groups are dead and report -2)
+                        val bx = ub * (1024f * 5f / 6f)
+                        var col = -1
+                        for (cc in 0 until 11) {
+                            if (bx >= menuColXs[cc] - 1024f / 12f &&
+                                bx < menuColXs[cc + 1] - 1024f / 12f
+                            ) { col = cc; break }
+                        }
+                        if (col < 0) -2
+                        else when (col) {
+                            in 0..7 -> col
+                            8 -> if (v < 0.415f) 8 else 9
+                            9 -> if (v < 0.415f) 10 else 11
+                            else -> 12
+                        }
+                    }
                 menuSeekHoverU = if (id == -1) seekFrac(u) else -1f
                 // Leaky dwell: adopt immediately; progress grows while still
                 // on target and drains slowly otherwise. Churn and motion
@@ -1228,7 +1356,7 @@ void main(){
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, videoTextureId)
         GLES20.glUniform1i(uTexOes, 0)
-        GLES20.glUniform1i(uStereoOes, when (stereo) { Stereo.MONO -> 0; Stereo.SBS -> 1; Stereo.OU -> 2 })
+        GLES20.glUniform1i(uStereoOes, when (stereo) { Stereo.MONO -> 0; Stereo.SBS -> 1; Stereo.TB -> 2 })
         GLES20.glUniform1i(uEyeOes, eye)
         GLES20.glUniform1f(uZoomOes, zoom.coerceIn(0.3f, 2.5f))
         GLES20.glUniformMatrix4fv(uMvpOes, 1, false, mvpM, 0)
@@ -1437,8 +1565,6 @@ void main(){
         p.color = Color.WHITE; p.textSize = 44f; p.textAlign = Paint.Align.CENTER
         c.drawText("✕", 962f, 72f, p)
         p.textAlign = Paint.Align.LEFT
-        p.textSize = 26f; p.color = Color.rgb(125, 211, 252)
-        c.drawText("stare to select • tap = center view • vol keys = volume", 40f, 114f, p)
         var y = ROWS_Y0
         for (i in scroll until end) {
             val r = rows[i]
@@ -1555,10 +1681,6 @@ void main(){
             }
             y += ROW_H
         }
-        if (rows.size > VISIBLE_ROWS) {
-            p.color = Color.rgb(125, 211, 252); p.textSize = 24f
-            c.drawText("… ${scroll + 1}-${end} of ${rows.size} (look up/down to scroll)", 44f, 1000f, p)
-        }
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, browserTexId)
         GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
         browserBitmap?.recycle()
@@ -1574,9 +1696,10 @@ void main(){
     private fun drawMenuPanel(warpCx: Float, aspect: Float) {
         maybeUploadMenu()
         // browser-pipeline panel (FBO + flatM with convergence): fuses
-        // exactly like the browser panel
+        // exactly like the browser panel. Animated elevation: the grid
+        // rebuilds each frame mid-flip, then settles (cached).
         val d = panelDistM
-        val el = Math.toRadians(menuElevDeg().toDouble()).toFloat()
+        val el = Math.toRadians(menuElevCurrent().toDouble()).toFloat()
         if (menuGrid == null || menuGridD != d || menuGridEl != el) {
             val cx = 0f; val cy = (kotlin.math.sin(el) * d); val cz = (-kotlin.math.cos(el) * d)
             var nx = -cx; var ny = -cy; var nz = -cz
@@ -1605,37 +1728,88 @@ void main(){
         val flashing = menuFlash.isNotEmpty() && now() < menuFlashUntil
         val h = menuHighlight * 31 + posSec * 131 + durSec * 17 +
             (if (menuPlaying) 1 else 0) + (if (flashing) 1009 else 0) + menuFlash.hashCode() +
-            (if (menuSeekHoverU >= 0f) (menuSeekHoverU * 128).toInt() else 0)
+            (if (menuSeekHoverU >= 0f) (menuSeekHoverU * 128).toInt() else 0) +
+            menuTitle.hashCode() * 7 + skipSecs
         if (h == lastMenuHash && menuBitmap != null) return
         lastMenuHash = h
-        val W = 1024; val H = 288
+        val W = 1024; val H = 352
         val bmp = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888)
         val c = Canvas(bmp)
         c.drawColor(Color.rgb(10, 14, 22))
         val p = Paint(Paint.ANTI_ALIAS_FLAG)
-        val icons = arrayOf("⏮", "−10s", if (menuPlaying) "⏸" else "▶", "+10s", "⏭", "⚙", "⧗", "🔊+", "🔊−", "Z−", "Z+", "📁")
-        val caps = arrayOf("prev", "rew", "play", "ff", "next", "settings", "shape", "vol+", "vol−", "zoom−", "zoom+", "files")
-        val bw = (W.toFloat() * 4f / 6f) / MENU_BUTTONS
-        val bx0 = W.toFloat() / 6f
-        for (i in 0 until MENU_BUTTONS) {
-            if (i == menuHighlight) {
+        // file name across the top
+        p.color = Color.WHITE; p.textSize = 28f; p.textAlign = Paint.Align.CENTER
+        c.drawText(menuTitle.take(48), W / 2f, 34f, p)
+        p.textAlign = Paint.Align.LEFT
+        val icons = arrayOf("⚙", "⧗", "📁", "⏮", "⏪", if (menuPlaying) "⏸" else "▶", "⏩", "⏭", "", "", "", "", "⇅")
+        // 11 columns across the middle 5/6 with wider empty gaps between
+        // the groups (transport | zoom | volume | flip) — see menuColXs.
+        // 0-7 + flip are full-height singles; zoom (8/9) and volume (10/11)
+        // stack + above - in one column each. Icons only, no captions.
+        fun drawBtn(id: Int, col: Int, y0: Float, y1: Float, isize: Float) {
+            val x0 = menuColXs[col] + 4f; val x1 = menuColXs[col + 1] - 4f
+            if (id == menuHighlight) {
                 p.color = Color.rgb(30, 58, 95)
-                c.drawRect(bx0 + i * bw + 4f, 8f, bx0 + (i + 1) * bw - 4f, 188f, p)
+                c.drawRect(x0, y0, x1, y1, p)
             }
-            p.color = Color.WHITE; p.textSize = 32f; p.textAlign = Paint.Align.CENTER
-            c.drawText(icons[i], bx0 + i * bw + bw / 2f, 76f, p)
-            p.color = Color.rgb(148, 163, 184); p.textSize = 16f
-            c.drawText(caps[i], bx0 + i * bw + bw / 2f, 120f, p)
+            val cx = (x0 + x1) / 2f
+            val cy = (y0 + y1) / 2f
+            if (id == 8 || id == 9) {
+                // plain vector magnifier: stroked lens + handle, with the
+                // +/- drawn inside the lens (emoji 🔍 turns to mush small)
+                val r = isize * 0.30f
+                val lx = cx - r * 0.35f; val ly = cy - r * 0.25f
+                val sw = (isize * 0.09f).coerceAtLeast(3f)
+                p.color = Color.WHITE; p.style = Paint.Style.STROKE; p.strokeWidth = sw
+                c.drawCircle(lx, ly, r, p)
+                val hx = lx + r * 0.72f; val hy = ly + r * 0.72f
+                c.drawLine(hx, hy, hx + r * 0.85f, hy + r * 0.85f, p)
+                p.style = Paint.Style.FILL
+                val bw2 = r * 1.1f
+                c.drawRect(lx - bw2 / 2f, ly - sw / 2f, lx + bw2 / 2f, ly + sw / 2f, p)
+                if (id == 8) c.drawRect(lx - sw / 2f, ly - bw2 / 2f, lx + sw / 2f, ly + bw2 / 2f, p)
+            } else if (id == 10 || id == 11) {
+                // vector speaker: identical body geometry in both halves,
+                // loud adds a second wave. Emoji 🔊/🔈 differ in width,
+                // bearings AND ink height, so no text alignment can ever
+                // line them up — drawing both from the same code does.
+                val s = isize * 0.36f
+                val sw = (isize * 0.09f).coerceAtLeast(3f)
+                p.color = Color.WHITE
+                p.style = Paint.Style.FILL
+                val bx1 = cx - s * 0.35f
+                c.drawRect(cx - s * 1.1f, cy - s * 0.55f, bx1, cy + s * 0.55f, p)
+                val tipX = cx + s * 0.25f
+                c.drawPath(android.graphics.Path().apply {
+                    moveTo(bx1, cy - s * 0.55f); lineTo(tipX, cy - s)
+                    lineTo(tipX, cy + s); lineTo(bx1, cy + s * 0.55f); close()
+                }, p)
+                p.style = Paint.Style.STROKE; p.strokeWidth = sw
+                fun wave(r: Float) = c.drawArc(
+                    tipX - r, cy - r, tipX + r, cy + r, -55f, 110f, false, p)
+                wave(s * 0.62f)
+                if (id == 10) wave(s * 1.12f)
+            } else {
+                p.color = Color.WHITE; p.textSize = isize; p.textAlign = Paint.Align.CENTER
+                c.drawText(icons[id], cx, cy + isize * 0.35f, p)
+            }
         }
+        for (i in 0..7) drawBtn(i, i, 56f, 236f, 60f)
+        drawBtn(8, 8, 56f, 146f, 48f)
+        drawBtn(9, 8, 146f, 236f, 48f)
+        drawBtn(10, 9, 56f, 146f, 48f)
+        drawBtn(11, 9, 146f, 236f, 48f)
+        drawBtn(12, 10, 56f, 236f, 60f)
+        p.textAlign = Paint.Align.LEFT
         // progress bar (seek zone)
         val frac = if (menuDurMs > 0) (menuPosMs.toFloat() / menuDurMs).coerceIn(0f, 1f) else 0f
         p.color = Color.rgb(51, 65, 85)
-        c.drawRect(24f, 208f, (W - 24).toFloat(), 240f, p)
+        c.drawRect(24f, 264f, (W - 24).toFloat(), 296f, p)
         p.color = Color.rgb(125, 211, 252)
-        c.drawRect(24f, 208f, 24f + (W - 48) * frac, 240f, p)
+        c.drawRect(24f, 264f, 24f + (W - 48) * frac, 296f, p)
         if (menuHighlight == -1) {
             p.color = Color.WHITE; p.style = Paint.Style.STROKE; p.strokeWidth = 4f
-            c.drawRect(24f, 208f, (W - 24).toFloat(), 240f, p)
+            c.drawRect(24f, 264f, (W - 24).toFloat(), 296f, p)
             p.style = Paint.Style.FILL
         }
         // live tooltip: time the current gaze position would seek to,
@@ -1646,21 +1820,26 @@ void main(){
             val tx = (24f + hf * (W - 48)).coerceIn(70f, (W - 70).toFloat())
             p.textSize = 15f; p.textAlign = Paint.Align.CENTER
             val tw = p.measureText(txt)
-            val bx0 = (tx - tw / 2f - 10f).coerceAtLeast(8f)
-            val bx1 = (tx + tw / 2f + 10f).coerceAtMost((W - 8).toFloat())
+            val tx0 = (tx - tw / 2f - 10f).coerceAtLeast(8f)
+            val tx1 = (tx + tw / 2f + 10f).coerceAtMost((W - 8).toFloat())
             p.color = Color.rgb(10, 14, 22)
-            c.drawRect(bx0, 242f, bx1, 264f, p)
+            c.drawRect(tx0, 298f, tx1, 320f, p)
             p.color = Color.rgb(125, 211, 252)
             p.style = Paint.Style.STROKE; p.strokeWidth = 2f
-            c.drawRect(bx0, 242f, bx1, 264f, p)
+            c.drawRect(tx0, 298f, tx1, 320f, p)
             p.style = Paint.Style.FILL
             p.color = Color.WHITE
-            c.drawText(txt, (bx0 + bx1) / 2f, 259f, p)
+            c.drawText(txt, (tx0 + tx1) / 2f, 315f, p)
             p.textAlign = Paint.Align.LEFT
         }
-        p.color = Color.WHITE; p.textSize = 16f; p.textAlign = Paint.Align.CENTER
-        c.drawText(if (flashing) menuFlash else "${fmtTime(menuPosMs)} / ${fmtTime(menuDurMs)}", W / 2f, 280f, p)
-        p.textAlign = Paint.Align.LEFT
+        // time/length under the seek bar (32px). Skipped while the seek
+        // tooltip bubble is up — it already shows the time at the gaze point
+        // and the two would overlap.
+        if (!(menuHighlight == -1 && menuSeekHoverU >= 0f && menuDurMs > 0)) {
+            p.color = Color.WHITE; p.textSize = 32f; p.textAlign = Paint.Align.CENTER
+            c.drawText(if (flashing) menuFlash else "${fmtTime(menuPosMs)} / ${fmtTime(menuDurMs)}", W / 2f, 342f, p)
+            p.textAlign = Paint.Align.LEFT
+        }
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, menuTexId)
         GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
         menuBitmap?.recycle()

@@ -15,5 +15,5 @@ enum class Projection(val label: String, val degrees: Float) {
 enum class Stereo(val label: String) {
     MONO("Mono / 2D"),
     SBS("Side-by-side"),
-    OU("Over-under");
+    TB("Top-bottom");
 }

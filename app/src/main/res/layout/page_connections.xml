@@ -4,11 +4,6 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:padding="12dp">
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Servers live here so you never type passwords in VR."
-        android:textAppearance="?attr/textAppearanceBodyMedium" />
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/listConnections"
         android:layout_width="match_parent"

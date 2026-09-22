@@ -55,6 +55,13 @@ class ConnectionStore(ctx: Context) {
     }
 }
 
+/** Process-memory navigation state: last location, deliberately NOT
+ *  persisted (fresh top level on every cold start). */
+object SessionMemory {
+    var lastConnectionId: String = ""
+    var lastPath: String = ""
+}
+
 /** Non-secret UI prefs: display mode, last location, buffer. */
 class SettingsStore(ctx: Context) {
     private val p = ctx.getSharedPreferences("domevr_settings", Context.MODE_PRIVATE)
@@ -96,12 +103,21 @@ class SettingsStore(ctx: Context) {
     var dwellMs: Long
         get() = p.getLong("dwell", 1500L).coerceIn(400L, 4000L)
         set(v) { p.edit().putLong("dwell", v).apply() }
+    /** Rewind/fast-forward jump in seconds (2D setting, VR buttons use it). */
+    var skipSecs: Int
+        get() = p.getInt("skip_secs", 10).coerceIn(2, 60)
+        set(v) { p.edit().putInt("skip_secs", v).apply() }
     /** Shaping grid enabled (per shape id, see shaping/shapes.json). */
     fun shapeEnabled(id: String): Boolean = p.getBoolean("shape_on_$id", false)
     fun setShapeEnabled(id: String, v: Boolean) { p.edit().putBoolean("shape_on_$id", v).apply() }
     /** Shaping grid weight 0..100% (per shape id). Default 100%. */
     fun shapeWeight(id: String): Float = p.getFloat("shape_w_$id", 100f).coerceIn(0f, 100f)
     fun setShapeWeight(id: String, v: Float) { p.edit().putFloat("shape_w_$id", v).apply() }
+    /** Granted SAF tree URIs (SD cards). Grants themselves persist via the
+     *  ContentResolver; this just remembers which trees were picked. */
+    var safTrees: Set<String>
+        get() = p.getStringSet("saf_trees", emptySet())?.toSet() ?: emptySet()
+        set(v) { p.edit().putStringSet("saf_trees", v.toSet()).apply() }
     /** DEG180 vertical stretch onset: half-height |p| where stretch starts.
      *  Displayed as % from top/bottom edge = (0.5 - onset) * 100. */
     var domeOnset: Float
@@ -140,15 +156,18 @@ class SettingsStore(ctx: Context) {
     var lensK2: Float
         get() = p.getFloat("lens_k2", 0.55f).coerceIn(0f, 1f)
         set(v) { p.edit().putFloat("lens_k2", v).apply() }
-    /** Look pitch (deg) that opens the VR play menu. Positive = look up,
-     *  negative = look down. */
-    var menuAngleDeg: Float
-        get() = p.getFloat("menu_angle", 65f).coerceIn(-90f, 90f)
-        set(v) { p.edit().putFloat("menu_angle", v).apply() }
-    var lastConnectionId: String
-        get() = p.getString("last_conn", "") ?: ""
-        set(v) { p.edit().putString("last_conn", v).apply() }
-    var lastPath: String
-        get() = p.getString("last_path", "") ?: ""
-        set(v) { p.edit().putString("last_path", v).apply() }
+    /** Look-up tilt (deg, 10..60) that opens the VR play menu when it is on top. */
+    var menuAngleUp: Float
+        get() = p.getFloat("menu_angle_up",
+            kotlin.math.abs(p.getFloat("menu_angle", 40f)).coerceIn(10f, 60f)).coerceIn(10f, 60f)
+        set(v) { p.edit().putFloat("menu_angle_up", v).apply() }
+    /** Look-down tilt (deg, stored negative, -60..-10) that opens the menu at the bottom. */
+    var menuAngleDown: Float
+        get() = p.getFloat("menu_angle_down",
+            -kotlin.math.abs(p.getFloat("menu_angle", 40f)).coerceIn(10f, 60f)).coerceIn(-60f, -10f)
+        set(v) { p.edit().putFloat("menu_angle_down", v).apply() }
+    /** Which side the play menu lives on; flipped by its ⇅ button. */
+    var menuTop: Boolean
+        get() = p.getBoolean("menu_top", true)
+        set(v) { p.edit().putBoolean("menu_top", v).apply() }
 }

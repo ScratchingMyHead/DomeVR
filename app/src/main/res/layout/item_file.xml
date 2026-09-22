@@ -13,17 +13,15 @@
             android:paddingStart="8dp">
             <TextView android:id="@+id/txtName"
                 android:layout_width="match_parent" android:layout_height="wrap_content"
-                android:singleLine="true" android:ellipsize="middle"
+                android:maxLines="2" android:ellipsize="end"
                 android:textAppearance="?attr/textAppearanceBodyLarge" />
             <TextView android:id="@+id/txtMeta"
                 android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:gravity="end"
                 android:textAppearance="?attr/textAppearanceBodySmall" />
         </LinearLayout>
         <com.google.android.material.button.MaterialButton android:id="@+id/btnScan"
             android:layout_width="wrap_content" android:layout_height="wrap_content"
             android:text="ⓘ" style="@style/Widget.Material3.Button.TextButton" />
-        <com.google.android.material.button.MaterialButton android:id="@+id/btnPlay"
-            android:layout_width="wrap_content" android:layout_height="wrap_content"
-            android:text="Play" style="@style/Widget.Material3.Button.TonalButton" />
     </LinearLayout>
 </com.google.android.material.card.MaterialCardView>

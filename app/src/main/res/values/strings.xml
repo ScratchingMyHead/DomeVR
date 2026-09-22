@@ -2,7 +2,7 @@
     <string name="app_name">DomeVR Player</string>
     <string name="tab_watch">Watch</string>
     <string name="tab_connections">Connections</string>
-    <string name="tab_display">Display</string>
+    <string name="tab_display">Settings</string>
     <string name="add_connection">Add connection</string>
     <string name="enter_vr">Enter VR</string>
     <string name="play_in_vr">Play in VR</string>

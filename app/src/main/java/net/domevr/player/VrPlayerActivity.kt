@@ -67,6 +67,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         data object Root : Loc
         data class Smb(val connId: String, val path: String) : Loc
         data class Local(val dir: File) : Loc
+        data class Saf(val treeUri: String, val relPath: String, val label: String) : Loc
         data object SettingsPage : Loc
         data object ShapingPage : Loc
         data object Sensors : Loc
@@ -90,7 +91,10 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         val previewHull: IntArray? = null, // shaping preview: convex-hull point indices
         val previewN: Int = 9, // shaping preview grid size (n x n)
         val previewPos: FloatArray? = null, // shaping preview: absolute [x,y] per point, [0,1], y down
-        val dead: Boolean = false // rest zone: gaze may park here, nothing fires
+        val dead: Boolean = false, // rest zone: gaze may park here, nothing fires
+        val saf: SafFiles.SafEntry? = null, // SAF (SD card) entries
+        val safTree: String = "",
+        val safRel: String = ""
     )
 
     /** Absolute preview positions from offsets: nominal + offset, y down. */
@@ -211,6 +215,22 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
     private var connId: String = ""
     private var playUrl: String? = null
     private var playIsProxy = false
+    // SAF (SD card) folder picker state: volume awaiting a grant.
+    private var pendingSafVolume: String? = null
+    private val safPicker = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            SafFiles.takeGrant(this, uri)
+            val cur = settings.safTrees.toMutableSet()
+            cur += uri.toString()
+            settings.safTrees = cur
+            val label = SafFiles.removableVolumes(this).find { it.uuid == pendingSafVolume }?.desc ?: "SD card"
+            pendingSafVolume = null
+            loc = Loc.Saf(uri.toString(), "", label)
+        } else pendingSafVolume = null
+        refresh()
+    }
 
     private lateinit var sensors: SensorManager
     private var rotSensor: Sensor? = null
@@ -337,10 +357,8 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             renderer.lastHeight = v.height.coerceAtLeast(1)
         }
         glView.setOnTouchListener { _, e ->
-            if (e.action == MotionEvent.ACTION_UP) {
-                renderer.recenter("tap")
-                Toast.makeText(this, "View centered", Toast.LENGTH_SHORT).show()
-            }
+            // Tap recenters silently: the world snapping is its own feedback.
+            if (e.action == MotionEvent.ACTION_UP) renderer.recenter("tap")
             true
         }
 
@@ -360,10 +378,8 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         magSensor = sensors.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
 
         findViewById<android.view.View>(R.id.btnClose).setOnClickListener { finish() }
-        findViewById<android.view.View>(R.id.btnBrowser).setOnClickListener { goBrowser() }
-        findViewById<android.view.View>(R.id.btnMode).setOnClickListener { cycleProjection() }
 
-        connId = intent.getStringExtra(EXTRA_CONN_ID) ?: settings.lastConnectionId
+        connId = intent.getStringExtra(EXTRA_CONN_ID) ?: SessionMemory.lastConnectionId
         val url = intent.getStringExtra(EXTRA_URL)
         if (url != null) {
             playIsProxy = url.startsWith("http://127.0.0.1")
@@ -374,8 +390,8 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             val qIndex = intent.getIntExtra(EXTRA_QUEUE_INDEX, -1)
             if (connId.startsWith("local:")) {
                 val dir = connId.removePrefix("local:")
-                settings.lastConnectionId = connId
-                settings.lastPath = ""
+                SessionMemory.lastConnectionId = connId
+                SessionMemory.lastPath = ""
                 playQueue = qPaths.map { PlayItem.Local(File(it)) }
                 playIndex = qIndex
                 if (playIndex !in playQueue.indices) {
@@ -383,11 +399,23 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                         (it as PlayItem.Local).f.absolutePath == File(dir, intent.getStringExtra(EXTRA_NAME) ?: "").absolutePath
                     }
                 }
+            } else if (connId.startsWith("saf:")) {
+                val treeUri = connId.removePrefix("saf:")
+                val relPath = intent.getStringExtra(EXTRA_PATH) ?: ""
+                SessionMemory.lastConnectionId = connId
+                SessionMemory.lastPath = relPath
+                playQueue = qPaths.map {
+                    PlayItem.Saf(it, android.net.Uri.parse(it).lastPathSegment ?: "video", treeUri, relPath)
+                }
+                playIndex = qIndex
+                if (playIndex !in playQueue.indices) {
+                    playIndex = playQueue.indexOfFirst { (it as? PlayItem.Saf)?.uri == url }
+                }
             } else if (connId.isNotEmpty()) {
                 val cleanId = connId.removePrefix("smb:")
-                val dirPath = intent.getStringExtra(EXTRA_PATH) ?: settings.lastPath
-                settings.lastConnectionId = "smb:$cleanId"
-                settings.lastPath = dirPath
+                val dirPath = intent.getStringExtra(EXTRA_PATH) ?: SessionMemory.lastPath
+                SessionMemory.lastConnectionId = "smb:$cleanId"
+                SessionMemory.lastPath = dirPath
                 playQueue = qPaths.map {
                     PlayItem.Smb(SmbEntry(it.substringAfterLast('\\'), it, false, -1), cleanId)
                 }
@@ -397,8 +425,8 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         } else {
             loc = when {
                 connId.startsWith("local:") -> Loc.Local(File(connId.removePrefix("local:")))
-                connId.startsWith("smb:") -> Loc.Smb(connId.removePrefix("smb:"), intent.getStringExtra(EXTRA_PATH) ?: settings.lastPath)
-                connId.isNotEmpty() -> Loc.Smb(connId, intent.getStringExtra(EXTRA_PATH) ?: settings.lastPath)
+                connId.startsWith("smb:") -> Loc.Smb(connId.removePrefix("smb:"), intent.getStringExtra(EXTRA_PATH) ?: SessionMemory.lastPath)
+                connId.isNotEmpty() -> Loc.Smb(connId, intent.getStringExtra(EXTRA_PATH) ?: SessionMemory.lastPath)
                 else -> Loc.Root
             }
             enterBrowser()
@@ -413,6 +441,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         renderer.panelDistM = settings.panelDistM
         renderer.dwellMs = settings.dwellMs
         renderer.pinVideo = settings.pinVideo
+        renderer.skipSecs = settings.skipSecs
         renderer.domeStretchK = settings.domeStretchK
         renderer.domeOnset = settings.domeOnset
         // Shaping grids: feed active set only when content changed (mesh rebuild is keyed).
@@ -428,7 +457,9 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         renderer.testSweep = settings.testSweep
         renderer.lensK1 = settings.lensK1
         renderer.lensK2 = settings.lensK2
-        renderer.menuAngleDeg = settings.menuAngleDeg
+        renderer.menuAngleUp = settings.menuAngleUp
+        renderer.menuAngleDown = settings.menuAngleDown
+        renderer.menuSideUp = settings.menuTop
         // Convergence: each screen half is its own NDC range, so move each
         // eye's image toward its half-center until the centers sit ipdMm
         // apart. o = 1 - ipd/spacing (NDC units), clamped to stay on-screen.
@@ -649,8 +680,25 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
     private fun enterBrowser() {
         player?.pause()
         renderer.mode = VrRenderer.Mode.BROWSER
+        // Default to the playing file's folder so Files opens where you are.
         // No recenter: the world (video + panel frame) must not move when
         // opening a menu. The panel stays world-locked; look around for it.
+        if (playIndex in playQueue.indices) {
+            when (val it = playQueue[playIndex]) {
+                is PlayItem.Smb -> loc = Loc.Smb(it.connId, it.e.path.substringBeforeLast('\\', ""))
+                is PlayItem.Local -> it.f.parentFile?.let { p -> loc = Loc.Local(p) }
+                is PlayItem.Saf -> {
+                    val cur = loc as? Loc.Saf
+                    loc = if (cur != null && cur.treeUri == it.treeUri) Loc.Saf(it.treeUri, it.relPath, cur.label)
+                    else {
+                        val label = SafFiles.removableVolumes(this).find { v ->
+                            SafFiles.grantedTree(this, v.uuid) == it.treeUri
+                        }?.desc ?: "SD card"
+                        Loc.Saf(it.treeUri, it.relPath, label)
+                    }
+                }
+            }
+        }
         refresh()
     }
 
@@ -662,6 +710,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             is Loc.Root -> showRoot()
             is Loc.Smb -> showSmb(l.connId, l.path)
             is Loc.Local -> showLocal(l.dir)
+            is Loc.Saf -> showSaf(l.treeUri, l.relPath, l.label)
             is Loc.SettingsPage -> showSettings()
             is Loc.ShapingPage -> showShaping()
             is Loc.Sensors -> showSensors()
@@ -685,11 +734,16 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             r += Row(c.label, "${c.unc} • ${if (c.username.isBlank()) "guest" else c.username}",
                 VrRenderer.BrowserRow.FOLDER, action = "smb:${c.id}")
         }
-        r += Row("This device", "phone storage", VrRenderer.BrowserRow.FOLDER, action = "local:")
+        r += Row("Internal Storage", "phone storage", VrRenderer.BrowserRow.FOLDER, action = "local:")
+        for (v in SafFiles.removableVolumes(this)) {
+            val granted = SafFiles.grantedTree(this, v.uuid) != null
+            r += Row(v.desc, if (granted) "SD card" else "tap to grant access",
+                VrRenderer.BrowserRow.FOLDER, action = "safroot:${v.uuid ?: ""}")
+        }
         r += Row("Settings", currentOpticsSummary(), VrRenderer.BrowserRow.ACTION, action = "settings:")
         r += Row("Shaping", "warp grids (dome correction)", VrRenderer.BrowserRow.ACTION, action = "shaping:")
         r += Row("Sensor debug", "live raw values", VrRenderer.BrowserRow.ACTION, action = "sensors:")
-        pushRows("DomeVR", if (connections.isEmpty()) "Add a server in the 2D app, or open This device" else "${connections.size} servers — stare to open", r)
+        pushRows("DomeVR", if (connections.isEmpty()) "Add a server in the 2D app, or open Internal Storage" else "${connections.size} servers — stare to open", r)
     }
 
     private fun currentOpticsSummary(): String =
@@ -705,6 +759,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 if (!SmbHolder.manager.isBoundTo(conn.id)) SmbHolder.manager.connect(conn)
                 val list = SmbHolder.manager.list(path)
                 val r = mutableListOf<Row>()
+                r += Row("⌂ (top)", "servers list", VrRenderer.BrowserRow.FOLDER, action = "home:")
                 r += Row(".. (up)", if (path.isEmpty()) "back to servers" else "parent folder", VrRenderer.BrowserRow.FOLDER, action = "up:")
                 for (e in list) {
                     val kind = if (e.isDir) VrRenderer.BrowserRow.FOLDER
@@ -723,27 +778,54 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 withContext(Dispatchers.Main) {
                     pushRows("Error", "SMB: ${t.message}",
                         listOf(Row(".. (back)", "${t.message?.take(60)}", VrRenderer.BrowserRow.FOLDER, action = "up:")))
-                    Toast.makeText(this@VrPlayerActivity, "SMB: ${t.message}", Toast.LENGTH_LONG).show()
+                    toast("SMB: ${t.message}", long = true)
+                }
+            }
+        }
+    }
+
+    private fun showSaf(treeUri: String, relPath: String, label: String) {
+        val titleRel = if (relPath.isEmpty()) "/" else "/${relPath.replace('/', '/')}"
+        pushRows("$label$titleRel", "Listing…",
+            listOf(Row("Loading…", "", VrRenderer.BrowserRow.FILE)))
+        lifecycleScope.launch(Dispatchers.IO) {
+            val kids = try {
+                SafFiles.list(this@VrPlayerActivity, android.net.Uri.parse(treeUri), relPath)
+            } catch (t: Throwable) { emptyList() }
+            val r = mutableListOf<Row>()
+            r += Row("⌂ (top)", "servers list", VrRenderer.BrowserRow.FOLDER, action = "home:")
+            r += Row(".. (up)", if (relPath.isEmpty()) "back to servers" else "parent folder",
+                VrRenderer.BrowserRow.FOLDER, action = "up:")
+            for (k in kids) {
+                val kind = if (k.isDir) VrRenderer.BrowserRow.FOLDER
+                    else if (SafFiles.isVideo(k)) VrRenderer.BrowserRow.VIDEO else VrRenderer.BrowserRow.FILE
+                val meta = if (k.isDir) "folder" else humanSize(k.size)
+                r += Row(k.name, meta, kind, smb = null, saf = k, safTree = treeUri, safRel = relPath)
+            }
+            withContext(Dispatchers.Main) {
+                if (loc == Loc.Saf(treeUri, relPath, label)) {
+                    pushRows("$label$titleRel", "${kids.size} items", r)
                 }
             }
         }
     }
 
     private fun showLocal(dir: File) {
-        pushRows("This device /${dir.name}", "Listing…",
+        pushRows("Internal Storage /${dir.name}", "Listing…",
             listOf(Row("Loading…", "", VrRenderer.BrowserRow.FILE)))
         lifecycleScope.launch(Dispatchers.IO) {
             val kids = try { LocalFiles.list(dir) } catch (t: Throwable) { emptyList() }
-            val r = mutableListOf<Row>()
-            val root = LocalFiles.externalRoot()
-            r += Row(".. (up)", if (dir == root) "back to servers" else "parent folder", VrRenderer.BrowserRow.FOLDER, action = "up:")
+                val r = mutableListOf<Row>()
+                val root = LocalFiles.externalRoot()
+                r += Row("⌂ (top)", "servers list", VrRenderer.BrowserRow.FOLDER, action = "home:")
+                r += Row(".. (up)", if (dir == root) "back to servers" else "parent folder", VrRenderer.BrowserRow.FOLDER, action = "up:")
             for (k in kids) {
                 val kind = if (k.isDir) VrRenderer.BrowserRow.FOLDER
                     else VrRenderer.BrowserRow.VIDEO
                 r += Row(k.name, if (k.isDir) "folder" else humanSize(k.size), kind, local = k.file)
             }
             withContext(Dispatchers.Main) {
-                pushRows("This device ${dir.absolutePath.removePrefix(root.absolutePath).ifEmpty { "/" }}",
+                pushRows("Internal Storage ${dir.absolutePath.removePrefix(root.absolutePath).ifEmpty { "/" }}",
                     "${kids.size} items", r)
             }
         }
@@ -758,9 +840,9 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 slideFmt = fmt)
         val r = mutableListOf(
             Row("Video", renderer.stereo.label, VrRenderer.BrowserRow.ACTION,
-                segLabels = listOf("2D", "SBS", "OU"),
-                segActions = listOf("setstereo2:MONO", "setstereo2:SBS", "setstereo2:OU"),
-                segSelected = when (renderer.stereo) { Stereo.MONO -> 0; Stereo.SBS -> 1; Stereo.OU -> 2 }),
+                segLabels = listOf("2D", "SBS", "TB"),
+                segActions = listOf("setstereo2:MONO", "setstereo2:SBS", "setstereo2:TB"),
+                segSelected = when (renderer.stereo) { Stereo.MONO -> 0; Stereo.SBS -> 1; Stereo.TB -> 2 }),
             Row("Screen", renderer.projection.label, VrRenderer.BrowserRow.ACTION,
                 segLabels = listOf("Flat", "180", "220", "270", "360"),
                 segActions = listOf("setscreen:FLAT", "setscreen:DEG180", "setscreen:DEG220", "setscreen:DEG270", "setscreen:DEG360"),
@@ -912,6 +994,13 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
 
     private fun Float.fmt(): String = String.format("%.2f", this)
 
+    /** Dual toast: 2D system toast plus the in-headset center toast
+     *  (system toasts are unreadable in VR). */
+    private fun toast(msg: String, long: Boolean = false) {
+        Toast.makeText(this, msg, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
+        renderer.showToast(msg)
+    }
+
     /** X close button (title bar): resume video if one exists, else server list.
      *  Never recenters: closing must not move the world. */
     private fun closeOverlay() {
@@ -934,6 +1023,19 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             return
         }
         val row = rows[idx]
+        // SAF (SD card) entries: folders navigate, videos play direct.
+        row.saf?.let { e ->
+            if (loc is Loc.Saf) {
+                val l = loc as Loc.Saf
+                if (e.isDir) {
+                    val child = if (l.relPath.isEmpty()) e.name else "${l.relPath}/${e.name}"
+                    loc = Loc.Saf(l.treeUri, child, l.label)
+                    refresh()
+                } else if (SafFiles.isVideo(e)) playSafFile(e.uri.toString(), e.name, l.treeUri, l.relPath)
+                else toast("Not a playable video")
+            }
+            return
+        }
         // segmented button row: horizontal gaze fraction picks the segment
         if (row.segActions.isNotEmpty()) {
             if (frac == null) return // DPAD tap carries no position; gaze only
@@ -954,7 +1056,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             is Loc.Smb -> row.smb?.let { e ->
                 if (e.isDir) { loc = Loc.Smb(l.connId, e.path); refresh() }
                 else if (e.isVideo()) playSmbFile(e, l.connId)
-                else Toast.makeText(this, "Not a playable video", Toast.LENGTH_SHORT).show()
+                else toast("Not a playable video")
             }
             is Loc.Local -> row.local?.let { f ->
                 if (f.isDirectory) { loc = Loc.Local(f); refresh() }
@@ -991,6 +1093,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
 
     private fun handleAction(act: String) {
         when {
+            act == "home:" -> { loc = Loc.Root; refresh() }
             act == "up:" -> {
                 loc = when (val l = loc) {
                     is Loc.Smb -> if (l.path.isEmpty()) Loc.Root else Loc.Smb(l.connId, l.path.substringBeforeLast('\\', ""))
@@ -998,6 +1101,8 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                         val root = LocalFiles.externalRoot()
                         if (l.dir == root || l.dir.parentFile == null) Loc.Root else Loc.Local(l.dir.parentFile!!)
                     }
+                    is Loc.Saf -> if (l.relPath.isEmpty()) Loc.Root
+                        else Loc.Saf(l.treeUri, l.relPath.substringBeforeLast('/', ""), l.label)
                     else -> Loc.Root
                 }
                 refresh()
@@ -1041,6 +1146,20 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 val p = runCatching { Projection.valueOf(act.removePrefix("setscreen:")) }.getOrDefault(Projection.DEG180)
                 settings.screenProj = p; settings.projection = p; renderer.projection = p; refresh()
             }
+            act.startsWith("safroot:") -> {
+                val uuid = act.removePrefix("safroot:").ifEmpty { null }
+                val tree = SafFiles.grantedTree(this, uuid)
+                if (tree != null) {
+                    val label = SafFiles.removableVolumes(this).find { it.uuid == uuid }?.desc ?: "SD card"
+                    loc = Loc.Saf(tree, "", label); refresh()
+                } else {
+                    pendingSafVolume = uuid
+                    try { safPicker.launch(null) }
+                    catch (_: Exception) {
+                        Toast.makeText(this, "No folder picker available", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
             act.startsWith("setlens:") -> {
                 if (act.removePrefix("setlens:") == "fisheye") {
                     settings.projection = Projection.FISHEYE; renderer.projection = Projection.FISHEYE
@@ -1053,13 +1172,13 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             act.startsWith("smb:") -> { loc = Loc.Smb(act.removePrefix("smb:"), ""); refresh() }
             act == "local:" -> {
                 if (LocalFiles.needsPermission(this)) {
-                    Toast.makeText(this, "Allow videos permission in the 2D app first", Toast.LENGTH_LONG).show()
+                    toast("Allow videos permission in the 2D app first", long = true)
                 } else loc = Loc.Local(LocalFiles.externalRoot())
                 refresh()
             }
             act == "set:proj" -> { cycleProjection(); refresh() }
             act == "set:stereo" -> {
-                renderer.stereo = when (renderer.stereo) { Stereo.MONO -> Stereo.SBS; Stereo.SBS -> Stereo.OU; Stereo.OU -> Stereo.MONO }
+                renderer.stereo = when (renderer.stereo) { Stereo.MONO -> Stereo.SBS; Stereo.SBS -> Stereo.TB; Stereo.TB -> Stereo.MONO }
                 settings.stereo = renderer.stereo; refresh()
             }
             act == "set:swap" -> { settings.swapEyes = !settings.swapEyes; applyOptics(); refresh() }
@@ -1089,13 +1208,13 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
     }
 
     // ---------------- playback ----------------
-    private fun playSmbFile(e: SmbEntry, connId: String) {
+    private fun playSmbFile(e: SmbEntry, connId: String, recenter: Boolean = true) {
         txtStatus.text = "Opening ${e.name}… (streaming, no download)"
         Log.i(TAG, "open smb: ${e.path}")
         // Remember the folder: re-entering VR (or the 2D app) must land
         // back in the directory the video was started from, not top level.
-        settings.lastConnectionId = "smb:$connId"
-        settings.lastPath = e.path.substringBeforeLast('\\', "")
+        SessionMemory.lastConnectionId = "smb:$connId"
+        SessionMemory.lastPath = e.path.substringBeforeLast('\\', "")
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 val probe = SmbHolder.manager.openRead(e.path)
@@ -1109,25 +1228,50 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 )
                 if (playIsProxy) playUrl?.let { StreamProxy.unregisterByUrl(it) }
                 playIsProxy = true; playUrl = url
-                withContext(Dispatchers.Main) { captureQueueSmb(e, connId); startPlayback(url, e.name) }
+                withContext(Dispatchers.Main) { captureQueueSmb(e, connId); startPlayback(url, e.name, recenter) }
             } catch (t: Throwable) {
                 Log.e(TAG, "smb open failed", t)
                 withContext(Dispatchers.Main) {
                     txtStatus.text = "Open failed: ${t.message}"
-                    Toast.makeText(this@VrPlayerActivity, "Open failed: ${t.message}", Toast.LENGTH_LONG).show()
+                    toast("Open failed: ${t.message}", long = true)
                 }
             }
         }
     }
 
-    private fun playLocalFile(f: File) {
+    private fun playLocalFile(f: File, recenter: Boolean = true) {
         if (playIsProxy) playUrl?.let { StreamProxy.unregisterByUrl(it) }
         playIsProxy = false
         playUrl = Uri.fromFile(f).toString()
-        settings.lastConnectionId = "local:${f.parentFile?.absolutePath ?: ""}"
-        settings.lastPath = ""
+        SessionMemory.lastConnectionId = "local:${f.parentFile?.absolutePath ?: ""}"
+        SessionMemory.lastPath = ""
         captureQueue(f)
-        startPlayback(playUrl!!, f.name)
+        startPlayback(playUrl!!, f.name, recenter)
+    }
+
+    /** SD-card video via SAF document Uri (ExoPlayer plays it directly). */
+    private fun playSafFile(uri: String, name: String, treeUri: String, relPath: String, recenter: Boolean = true) {
+        if (playIsProxy) playUrl?.let { StreamProxy.unregisterByUrl(it) }
+        playIsProxy = false
+        playUrl = uri
+        SessionMemory.lastConnectionId = "saf:$treeUri"
+        SessionMemory.lastPath = relPath
+        captureQueueSaf(uri, treeUri, relPath)
+        startPlayback(playUrl!!, name, recenter)
+    }
+
+    private fun captureQueueSaf(currentUri: String, treeUri: String, relPath: String) {
+        val vids = rows.mapNotNull { r ->
+            val e = r.saf
+            if (r.kind == VrRenderer.BrowserRow.VIDEO && e != null && !e.isDir)
+                PlayItem.Saf(e.uri.toString(), e.name, treeUri, relPath) else null
+        }
+        if (vids.isNotEmpty()) {
+            playQueue = vids
+            playIndex = vids.indexOfFirst { it.uri == currentUri }
+        } else {
+            playIndex = playQueue.indexOfFirst { (it as? PlayItem.Saf)?.uri == currentUri }
+        }
     }
 
     // ---------------- play menu ----------------
@@ -1136,6 +1280,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
     private sealed class PlayItem {
         data class Smb(val e: SmbEntry, val connId: String) : PlayItem()
         data class Local(val f: File) : PlayItem()
+        data class Saf(val uri: String, val name: String, val treeUri: String, val relPath: String) : PlayItem()
     }
     private var playQueue: List<PlayItem> = emptyList()
     private var playIndex = -1
@@ -1177,15 +1322,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         val p = player ?: return
         when (e) {
             is VrRenderer.MenuEvent.Press -> when (e.idx) {
-                0 -> stepQueue(-1)
-                1 -> p.seekTo((p.currentPosition - 10_000).coerceAtLeast(0))
-                2 -> p.playWhenReady = !p.playWhenReady
-                3 -> {
-                    val d = p.duration.coerceAtLeast(0)
-                    p.seekTo((p.currentPosition + 10_000).coerceAtMost(d))
-                }
-                4 -> stepQueue(1)
-                5 -> {
+                0 -> {
                     // 3D settings page over the video (player keeps running,
                     // so zoom/FOV/type changes preview live on return).
                     // No recenter: opening must not move the world.
@@ -1194,28 +1331,47 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                     renderer.mode = VrRenderer.Mode.BROWSER
                     refresh()
                 }
-                6 -> {
+                1 -> {
                     // 3D shaping page over the video (same resume behaviour).
                     settingsFromVideo = true
                     loc = Loc.ShapingPage
                     renderer.mode = VrRenderer.Mode.BROWSER
                     refresh()
                 }
-                7 -> audioManager().adjustStreamVolume(
+                2 -> enterBrowser() // 3D file browser, opens the playing file's folder
+                3 -> stepQueue(-1)
+                4 -> p.seekTo((p.currentPosition - settings.skipSecs * 1000).coerceAtLeast(0))
+                5 -> p.playWhenReady = !p.playWhenReady
+                6 -> {
+                    val d = p.duration.coerceAtLeast(0)
+                    p.seekTo((p.currentPosition + settings.skipSecs * 1000).coerceAtMost(d))
+                }
+                7 -> stepQueue(1)
+                8 -> { settings.videoZoom = (settings.videoZoom + 0.1f).coerceIn(0.3f, 2.5f); applyOptics() }
+                9 -> { settings.videoZoom = (settings.videoZoom - 0.1f).coerceIn(0.3f, 2.5f); applyOptics() }
+                10 -> audioManager().adjustStreamVolume(
                     android.media.AudioManager.STREAM_MUSIC,
                     android.media.AudioManager.ADJUST_RAISE,
                     android.media.AudioManager.FLAG_SHOW_UI)
-                8 -> audioManager().adjustStreamVolume(
+                11 -> audioManager().adjustStreamVolume(
                     android.media.AudioManager.STREAM_MUSIC,
                     android.media.AudioManager.ADJUST_LOWER,
                     android.media.AudioManager.FLAG_SHOW_UI)
-                9 -> { settings.videoZoom = (settings.videoZoom - 0.1f).coerceIn(0.3f, 2.5f); applyOptics() }
-                10 -> { settings.videoZoom = (settings.videoZoom + 0.1f).coerceIn(0.3f, 2.5f); applyOptics() }
-                11 -> enterBrowser() // 3D file browser, staying in the open folder
+                12 -> {
+                    // ⇅ flip: sweep the menu top<->bottom, then auto-hide as
+                    // the gaze leaves the activation zone (existing close band).
+                    renderer.menuToggleSide()
+                    settings.menuTop = renderer.menuSideUp
+                }
             }
             is VrRenderer.MenuEvent.Seek -> {
                 val d = p.duration.coerceAtLeast(0)
-                if (d > 0) p.seekTo((e.frac.coerceIn(0f, 1f) * d).toLong())
+                if (d > 0) {
+                    // optimistic position: bar jumps before the seek lands
+                    val target = (e.frac.coerceIn(0f, 1f) * d).toLong()
+                    renderer.menuPosMs = target
+                    p.seekTo(target)
+                }
             }
         }
     }
@@ -1235,15 +1391,18 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         }
         playIndex = n
         when (val it = playQueue[n]) {
-            is PlayItem.Smb -> playSmbFile(it.e, it.connId)
-            is PlayItem.Local -> playLocalFile(it.f)
+            is PlayItem.Smb -> playSmbFile(it.e, it.connId, recenter = false)
+            is PlayItem.Local -> playLocalFile(it.f, recenter = false)
+            is PlayItem.Saf -> playSafFile(it.uri, it.name, it.treeUri, it.relPath, recenter = false)
         }
     }
 
     private var playerSwDecode: Boolean? = null
-    private fun startPlayback(url: String, name: String) {
+    private fun startPlayback(url: String, name: String, recenter: Boolean = true) {
         renderer.mode = VrRenderer.Mode.VIDEO
-        renderer.resetBasis("video") // video centers on wherever you're looking
+        renderer.menuTitle = name
+        // Queue steps keep the current center; fresh plays center on the gaze.
+        if (recenter) renderer.resetBasis("video")
         // Decoder preference is baked at player build time; rebuild if the
         // user flipped it since (applies to videos opened after changing).
         if (player == null || playerSwDecode != settings.softwareDecode) {
@@ -1292,7 +1451,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                     override fun onPlayerError(error: PlaybackException) {
                         FileLog.e(TAG, "player error: ${error.message}", error)
                         txtStatus.text = "Playback error: ${error.errorCodeName} — ${error.message?.take(120)}"
-                        Toast.makeText(this@VrPlayerActivity, "Playback error: ${error.message}", Toast.LENGTH_LONG).show()
+                        toast("Playback error: ${error.message}", long = true)
                     }
                     override fun onTracksChanged(tracks: Tracks) {
                         // Codec/resolution/bitrate once known — rules out
@@ -1402,6 +1561,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         Log.i(TAG, "play: $url")
         player?.setMediaItem(MediaItem.fromUri(url))
         player?.prepare()
+        player?.playWhenReady = true
         txtStatus.text = "▶ $name  •  ${renderer.projection.label} ${renderer.stereo.label}"
     }
 

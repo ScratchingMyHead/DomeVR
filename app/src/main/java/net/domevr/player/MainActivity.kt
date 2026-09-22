@@ -21,7 +21,6 @@ import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.bottomnavigation.BottomNavigationView
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.slider.Slider
-import com.google.android.material.textfield.MaterialAutoCompleteTextView
 import com.google.android.material.textfield.TextInputEditText
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -48,6 +47,7 @@ class MainActivity : AppCompatActivity() {
         data object Root : WLoc
         data class Smb(val connId: String, val path: String) : WLoc
         data class Local(val dir: File) : WLoc
+        data class Saf(val treeUri: String, val relPath: String, val label: String) : WLoc
     }
     private var wloc: WLoc = WLoc.Root
     private var smbEntries: List<SmbEntry> = emptyList()
@@ -55,12 +55,51 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fileAdapter: FileAdapter
 
     private val permLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) openLocalRoot() else Toast.makeText(this, "Videos permission needed for This device", Toast.LENGTH_LONG).show()
+        if (granted) openLocalRoot() else Toast.makeText(this, "Videos permission needed for Internal Storage", Toast.LENGTH_LONG).show()
+    }
+
+    // SAF (SD card) folder picker state: volume awaiting a grant.
+    private var pendingSafVolume: String? = null
+    private val safPicker = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            SafFiles.takeGrant(this, uri)
+            val cur = settings.safTrees.toMutableSet()
+            cur += uri.toString()
+            settings.safTrees = cur
+            val label = SafFiles.removableVolumes(this).find { it.uuid == pendingSafVolume }?.desc ?: "SD card"
+            pendingSafVolume = null
+            wloc = WLoc.Saf(uri.toString(), "", label)
+        } else pendingSafVolume = null
+        renderWatch()
+    }
+
+    /** Open a file sent by another app (file manager → Open with → DomeVR). */
+    private fun handleViewIntent(intent: Intent?) {
+        val uri = intent?.data ?: return
+        if (intent.action != Intent.ACTION_VIEW) return
+        var name = "video"
+        try {
+            contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+                null, null, null)?.use { c ->
+                if (c.moveToFirst()) name = c.getString(0) ?: name
+            }
+        } catch (_: Exception) { }
+        launchVr(uri.toString(), name, "", "", arrayListOf(), -1)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleViewIntent(intent)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         FileLog.init(this)
+        // Check media permission up front so local browsing never dead-ends.
+        if (LocalFiles.needsPermission(this)) permLauncher.launch(LocalFiles.requestPermission())
         setContentView(R.layout.activity_main)
         store = ConnectionStore(this)
         settings = SettingsStore(this)
@@ -68,7 +107,7 @@ class MainActivity : AppCompatActivity() {
 
         container = findViewById(R.id.container)
         val toolbar = findViewById<com.google.android.material.appbar.MaterialToolbar>(R.id.toolbar)
-        toolbar.subtitle = "SMB VR player — no downloads • v${BuildConfig.VERSION_NAME}"
+        toolbar.subtitle = "v${BuildConfig.VERSION_NAME}"
         toolbar.inflateMenu(R.menu.main_toolbar)
         toolbar.setOnMenuItemClickListener {
             if (it.itemId == R.id.action_vr) { enterVrBrowser(); true } else false
@@ -83,6 +122,7 @@ class MainActivity : AppCompatActivity() {
             true
         }
         showWatch()
+        handleViewIntent(intent)
     }
 
     override fun onResume() {
@@ -99,20 +139,18 @@ class MainActivity : AppCompatActivity() {
         // exiting a video must land back in its directory, not top level.
         // Only when the user hasn't navigated the 2D list elsewhere.
         if (wloc == WLoc.Root) {
-            val connRef = settings.lastConnectionId
+            val connRef = SessionMemory.lastConnectionId
             if (connRef.isNotEmpty()) {
                 when {
                     connRef.startsWith("local:") -> {
                         val d = java.io.File(connRef.removePrefix("local:"))
                         if (d.isDirectory) wloc = WLoc.Local(d)
                     }
-                    connRef.startsWith("smb:") -> wloc = WLoc.Smb(connRef.removePrefix("smb:"), settings.lastPath)
-                    else -> wloc = WLoc.Smb(connRef, settings.lastPath)
+                    connRef.startsWith("smb:") -> wloc = WLoc.Smb(connRef.removePrefix("smb:"), SessionMemory.lastPath)
+                    else -> wloc = WLoc.Smb(connRef, SessionMemory.lastPath)
                 }
             }
         }
-        val spinner = v.findViewById<MaterialAutoCompleteTextView>(R.id.spinnerConnection)
-        val txtPath = v.findViewById<TextView>(R.id.txtPath)
         val list = v.findViewById<RecyclerView>(R.id.listFiles)
         list.layoutManager = LinearLayoutManager(this)
         fileAdapter = FileAdapter(
@@ -121,38 +159,41 @@ class MainActivity : AppCompatActivity() {
             onScan = { scanWatchEntry(it) }
         )
         list.adapter = fileAdapter
-        // connection quick-jump dropdown (optional shortcut; list below is the real nav)
-        val labels = listOf("Browse all…") + connections.map { it.label }
-        spinner.setAdapter(ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, labels))
-        spinner.setText("Browse all…", false)
-        spinner.setOnItemClickListener { _, _, pos, _ ->
-            if (pos == 0) { wloc = WLoc.Root; renderWatch() }
-            else {
-                val c = connections[pos - 1]
-                wloc = WLoc.Smb(c.id, "")
-                renderWatch()
-            }
-        }
-        v.findViewById<View>(R.id.btnUp).setOnClickListener { watchUp() }
-        v.findViewById<View>(R.id.btnConnect).setOnClickListener { renderWatch() }
+        v.findViewById<View>(R.id.btnUp).setOnClickListener { watchHome() }
         renderWatch()
     }
 
     private sealed interface WatchEntry {
         data class RootConn(val conn: SmbConnection) : WatchEntry
         data object RootLocal : WatchEntry
+        data class SdVolume(val desc: String, val uuid: String?) : WatchEntry
         data class Smb(val e: SmbEntry) : WatchEntry
         data class Local(val e: LocalFiles.LocalEntry) : WatchEntry
+        data class Saf(val e: SafFiles.SafEntry, val treeUri: String, val relPath: String) : WatchEntry
         data object Up : WatchEntry
+    }
+
+    private fun openSafVolume(v: SafFiles.VolumeInfo) {
+        val tree = SafFiles.grantedTree(this, v.uuid)
+        if (tree != null) wloc = WLoc.Saf(tree, "", v.desc)
+        else {
+            pendingSafVolume = v.uuid
+            try { safPicker.launch(null) } catch (_: Exception) {
+                Toast.makeText(this, "No folder picker available", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+        renderWatch()
     }
 
     private fun watchTitle(): String = when (val l = wloc) {
         is WLoc.Root -> "/"
+        is WLoc.Saf -> "/${l.label}${if (l.relPath.isEmpty()) "" else "/${l.relPath}"}"
         is WLoc.Smb -> {
             val c = connections.find { it.id == l.connId }
             "/${c?.label ?: "?"}${if (l.path.isEmpty()) "" else "/${l.path}".replace('\\', '/')}"
         }
-        is WLoc.Local -> "/This device${l.dir.absolutePath.removePrefix(LocalFiles.externalRoot().absolutePath).ifEmpty { "/" }}"
+        is WLoc.Local -> "/Internal Storage${l.dir.absolutePath.removePrefix(LocalFiles.externalRoot().absolutePath).ifEmpty { "/" }}"
     }
 
     private fun renderWatch() {
@@ -163,7 +204,21 @@ class MainActivity : AppCompatActivity() {
                 val items = mutableListOf<WatchEntry>()
                 connections.forEach { items += WatchEntry.RootConn(it) }
                 items += WatchEntry.RootLocal
+                SafFiles.removableVolumes(this).forEach { items += WatchEntry.SdVolume(it.desc, it.uuid) }
                 fileAdapter.submit(items)
+            }
+            is WLoc.Saf -> {
+                fileAdapter.submit(listOf(WatchEntry.Up))
+                lifecycleScope.launch(Dispatchers.IO) {
+                    val kids = try {
+                        SafFiles.list(this@MainActivity, Uri.parse(l.treeUri), l.relPath)
+                    } catch (t: Throwable) { emptyList() }
+                    val items = mutableListOf<WatchEntry>(WatchEntry.Up)
+                    kids.forEach { items += WatchEntry.Saf(it, l.treeUri, l.relPath) }
+                    withContext(Dispatchers.Main) {
+                        if (wloc == l) fileAdapter.submit(items)
+                    }
+                }
             }
             is WLoc.Smb -> {
                 val conn = connections.find { it.id == l.connId }
@@ -208,6 +263,8 @@ class MainActivity : AppCompatActivity() {
         wloc = when (val l = wloc) {
             is WLoc.Root -> WLoc.Root
             is WLoc.Smb -> if (l.path.isEmpty()) WLoc.Root else WLoc.Smb(l.connId, l.path.substringBeforeLast('\\', ""))
+            is WLoc.Saf -> if (l.relPath.isEmpty()) WLoc.Root
+                else WLoc.Saf(l.treeUri, l.relPath.substringBeforeLast('/', ""), l.label)
             is WLoc.Local -> {
                 val root = LocalFiles.externalRoot()
                 if (l.dir == root || l.dir.parentFile == null) WLoc.Root else WLoc.Local(l.dir.parentFile!!)
@@ -216,13 +273,25 @@ class MainActivity : AppCompatActivity() {
         renderWatch()
     }
 
+    /** Top-level home button: jump straight to the server list. */
+    private fun watchHome() {
+        wloc = WLoc.Root
+        renderWatch()
+    }
+
     private fun handleWatchClick(e: WatchEntry) {
         when (e) {
             is WatchEntry.Up -> watchUp()
             is WatchEntry.RootConn -> { wloc = WLoc.Smb(e.conn.id, ""); renderWatch() }
             is WatchEntry.RootLocal -> openLocalRoot()
+            is WatchEntry.SdVolume -> openSafVolume(SafFiles.VolumeInfo(e.uuid, e.desc))
             is WatchEntry.Smb -> if (e.e.isDir) { wloc = WLoc.Smb((wloc as WLoc.Smb).connId, e.e.path); renderWatch() }
             is WatchEntry.Local -> if (e.e.isDir) { wloc = WLoc.Local(e.e.file); renderWatch() }
+            is WatchEntry.Saf -> if (e.e.isDir) {
+                val child = if (e.relPath.isEmpty()) e.e.name else "${e.relPath}/${e.e.name}"
+                wloc = WLoc.Saf(e.treeUri, child, (wloc as? WLoc.Saf)?.label ?: "SD card")
+                renderWatch()
+            }
         }
     }
 
@@ -235,6 +304,17 @@ class MainActivity : AppCompatActivity() {
 
     private fun playWatchEntry(e: WatchEntry) {
         when (e) {
+            is WatchEntry.SdVolume -> openSafVolume(SafFiles.VolumeInfo(e.uuid, e.desc))
+            is WatchEntry.Saf -> {
+                if (!SafFiles.isVideo(e.e)) { Toast.makeText(this, "Only video files play", Toast.LENGTH_SHORT).show(); return }
+                val sibs = try {
+                    SafFiles.list(this, Uri.parse(e.treeUri), e.relPath).filter { SafFiles.isVideo(it) }
+                } catch (t: Throwable) { emptyList() }
+                val qp = ArrayList(sibs.map { it.uri.toString() })
+                var qi = qp.indexOf(e.e.uri.toString())
+                if (qi < 0) { qp.add(0, e.e.uri.toString()); qi = 0 }
+                launchVr(e.e.uri.toString(), e.e.name, "saf:${e.treeUri}", e.relPath, qp, qi)
+            }
             is WatchEntry.Smb -> {
                 if (!e.e.isVideo()) { Toast.makeText(this, "Only video files play", Toast.LENGTH_SHORT).show(); return }
                 val connId = (wloc as? WLoc.Smb)?.connId ?: return
@@ -341,9 +421,14 @@ class MainActivity : AppCompatActivity() {
         val connRef = when (val l = wloc) {
             is WLoc.Smb -> "smb:${l.connId}"
             is WLoc.Local -> "local:${l.dir.absolutePath}"
+            is WLoc.Saf -> "saf:${l.treeUri}"
             is WLoc.Root -> ""
         }
-        val path = (wloc as? WLoc.Smb)?.path ?: ""
+        val path = when (val l = wloc) {
+            is WLoc.Smb -> l.path
+            is WLoc.Saf -> l.relPath
+            else -> ""
+        }
         val i = Intent(this, VrPlayerActivity::class.java).apply {
             putExtra(VrPlayerActivity.EXTRA_PROJ, settings.projection.name)
             putExtra(VrPlayerActivity.EXTRA_STEREO, settings.stereo.name)
@@ -416,7 +501,7 @@ class MainActivity : AppCompatActivity() {
             Projection.DEG360 to R.id.mode360, Projection.FISHEYE to R.id.modeFisheye
         )
         v.findViewById<RadioButton>(projIds[settings.projection]!!).isChecked = true
-        val stereoIds = mapOf(Stereo.MONO to R.id.stereoMono, Stereo.SBS to R.id.stereoSbs, Stereo.OU to R.id.stereoOu)
+        val stereoIds = mapOf(Stereo.MONO to R.id.stereoMono, Stereo.SBS to R.id.stereoSbs, Stereo.TB to R.id.stereoTb)
         v.findViewById<RadioButton>(stereoIds[settings.stereo]!!).isChecked = true
         v.findViewById<android.widget.RadioGroup>(R.id.groupProjection).setOnCheckedChangeListener { _, id ->
             settings.projection = when (id) {
@@ -427,15 +512,17 @@ class MainActivity : AppCompatActivity() {
         }
         v.findViewById<android.widget.RadioGroup>(R.id.groupStereo).setOnCheckedChangeListener { _, id ->
             settings.stereo = when (id) {
-                R.id.stereoSbs -> Stereo.SBS; R.id.stereoOu -> Stereo.OU; else -> Stereo.MONO
+                R.id.stereoSbs -> Stereo.SBS; R.id.stereoTb -> Stereo.TB; else -> Stereo.MONO
             }
         }
         bindSlider(v, R.id.sliderFov, R.id.lblFov, settings.fovDeg, "Field of view", "°") { settings.fovDeg = it }
         bindSlider(v, R.id.sliderIpd, R.id.lblIpd, settings.ipdMm, "Eye separation (IPD)", "mm") { settings.ipdMm = it }
         bindSlider(v, R.id.sliderZoom, R.id.lblZoom, settings.videoZoom, "Video size (zoom)", "×") { settings.videoZoom = it }
+        bindSlider(v, R.id.sliderSkip, R.id.lblSkip, settings.skipSecs.toFloat(), "Skip forward/back", "s") { settings.skipSecs = it.toInt() }
         bindSlider(v, R.id.sliderLensK1, R.id.lblLensK1, settings.lensK1, "Lens distortion k1", "") { settings.lensK1 = it }
         bindSlider(v, R.id.sliderLensK2, R.id.lblLensK2, settings.lensK2, "Lens distortion k2", "") { settings.lensK2 = it }
-        bindSlider(v, R.id.sliderMenuAngle, R.id.lblMenuAngle, settings.menuAngleDeg, "Play-menu look angle (− = down)", "°") { settings.menuAngleDeg = it }
+        bindSlider(v, R.id.sliderMenuAngleUp, R.id.lblMenuAngleUp, settings.menuAngleUp, "Play-menu look-up angle", "°") { settings.menuAngleUp = it }
+        bindSlider(v, R.id.sliderMenuAngleDown, R.id.lblMenuAngleDown, -settings.menuAngleDown, "Play-menu look-down angle", "°") { settings.menuAngleDown = -it }
         bindSlider(v, R.id.sliderPanel, R.id.lblPanel, settings.panelDistM, "Browser panel distance", "m") { settings.panelDistM = it }
         val dwell = v.findViewById<Slider>(R.id.sliderDwell)
         dwell.value = snapToGrid(settings.dwellMs.toFloat(), dwell.valueFrom, dwell.valueTo, dwell.stepSize)
@@ -513,7 +600,6 @@ class MainActivity : AppCompatActivity() {
             val name: TextView = v.findViewById(R.id.txtName)
             val meta: TextView = v.findViewById(R.id.txtMeta)
             val icon: TextView = v.findViewById(R.id.txtIcon)
-            val play: View = v.findViewById(R.id.btnPlay)
             val scan: View = v.findViewById(R.id.btnScan)
         }
         override fun onCreateViewHolder(p: ViewGroup, t: Int) =
@@ -523,28 +609,35 @@ class MainActivity : AppCompatActivity() {
             when (val e = items[pos]) {
                 is WatchEntry.Up -> {
                     h.name.text = ".. (up)"; h.meta.text = ""; h.icon.text = "📁"
-                    h.play.visibility = View.GONE
                     h.scan.visibility = View.GONE
                     h.itemView.setOnClickListener { onClick(e) }
                 }
                 is WatchEntry.RootConn -> {
                     h.name.text = e.conn.label; h.meta.text = e.conn.unc; h.icon.text = "🗄"
-                    h.play.visibility = View.GONE
                     h.scan.visibility = View.GONE
                     h.itemView.setOnClickListener { onClick(e) }
                 }
                 is WatchEntry.RootLocal -> {
-                    h.name.text = "This device"; h.meta.text = "phone storage"; h.icon.text = "📱"
-                    h.play.visibility = View.GONE
+                    h.name.text = "Internal Storage"; h.meta.text = "phone storage"; h.icon.text = "📱"
                     h.scan.visibility = View.GONE
                     h.itemView.setOnClickListener { onClick(e) }
+                }
+                is WatchEntry.SdVolume -> {
+                    h.name.text = e.desc; h.meta.text = "SD card"; h.icon.text = "💾"
+                    h.scan.visibility = View.GONE
+                    h.itemView.setOnClickListener { onClick(e) }
+                }
+                is WatchEntry.Saf -> {
+                    h.name.text = e.e.name
+                    h.meta.text = if (e.e.isDir) "Folder" else MainActivity.humanSize(e.e.size)
+                    h.icon.text = if (e.e.isDir) "📁" else if (SafFiles.isVideo(e.e)) "🎬" else "📄"
+                    h.scan.visibility = View.GONE
+                    h.itemView.setOnClickListener { if (e.e.isDir) onClick(e) else onPlay(e) }
                 }
                 is WatchEntry.Smb -> {
                     h.name.text = e.e.name
                     h.meta.text = if (e.e.isDir) "Folder" else MainActivity.humanSize(e.e.size)
                     h.icon.text = if (e.e.isDir) "📁" else if (e.e.isVideo()) "🎬" else "📄"
-                    h.play.visibility = if (e.e.isVideo()) View.VISIBLE else View.GONE
-                    h.play.setOnClickListener { onPlay(e) }
                     h.scan.visibility = if (e.e.isVideo()) View.VISIBLE else View.GONE
                     h.scan.setOnClickListener { onScan(e) }
                     h.itemView.setOnClickListener { if (e.e.isDir) onClick(e) else if (e.e.isVideo()) onPlay(e) }
@@ -553,8 +646,6 @@ class MainActivity : AppCompatActivity() {
                     h.name.text = e.e.name
                     h.meta.text = if (e.e.isDir) "Folder" else MainActivity.humanSize(e.e.size)
                     h.icon.text = if (e.e.isDir) "📁" else "🎬"
-                    h.play.visibility = if (!e.e.isDir) View.VISIBLE else View.GONE
-                    h.play.setOnClickListener { onPlay(e) }
                     h.scan.visibility = if (!e.e.isDir) View.VISIBLE else View.GONE
                     h.scan.setOnClickListener { onScan(e) }
                     h.itemView.setOnClickListener { if (e.e.isDir) onClick(e) else onPlay(e) }

@@ -28,7 +28,7 @@
         android:layout_width="match_parent" android:layout_height="wrap_content">
         <RadioButton android:id="@+id/stereoMono" android:text="Mono / 2D" android:layout_width="wrap_content" android:layout_height="wrap_content" />
         <RadioButton android:id="@+id/stereoSbs" android:text="Side-by-side (SBS)" android:layout_width="wrap_content" android:layout_height="wrap_content" />
-        <RadioButton android:id="@+id/stereoOu" android:text="Over-under (OU)" android:layout_width="wrap_content" android:layout_height="wrap_content" />
+        <RadioButton android:id="@+id/stereoTb" android:text="Top-bottom (TB)" android:layout_width="wrap_content" android:layout_height="wrap_content" />
     </RadioGroup>
 
     <TextView android:id="@+id/lblFov" android:text="Field of view"
@@ -65,13 +65,22 @@
         android:valueFrom="0" android:valueTo="1" android:stepSize="0.01"
         app:labelBehavior="floating" />
 
-    <TextView android:id="@+id/lblMenuAngle" android:text="Play-menu look angle (− = down)"
+    <TextView android:id="@+id/lblMenuAngleUp" android:text="Play-menu look-up angle"
         android:textAppearance="?attr/textAppearanceTitleSmall"
         android:layout_width="wrap_content" android:layout_height="wrap_content"
         android:paddingTop="12dp" />
-    <com.google.android.material.slider.Slider android:id="@+id/sliderMenuAngle"
+    <com.google.android.material.slider.Slider android:id="@+id/sliderMenuAngleUp"
         android:layout_width="match_parent" android:layout_height="wrap_content"
-        android:valueFrom="-90" android:valueTo="90" android:stepSize="1"
+        android:valueFrom="10" android:valueTo="60" android:stepSize="1"
+        app:labelBehavior="floating" />
+
+    <TextView android:id="@+id/lblMenuAngleDown" android:text="Play-menu look-down angle"
+        android:textAppearance="?attr/textAppearanceTitleSmall"
+        android:layout_width="wrap_content" android:layout_height="wrap_content"
+        android:paddingTop="12dp" />
+    <com.google.android.material.slider.Slider android:id="@+id/sliderMenuAngleDown"
+        android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:valueFrom="10" android:valueTo="60" android:stepSize="1"
         app:labelBehavior="floating" />
 
     <com.google.android.material.switchmaterial.SwitchMaterial
@@ -100,6 +109,14 @@
     <com.google.android.material.slider.Slider android:id="@+id/sliderZoom"
         android:layout_width="match_parent" android:layout_height="wrap_content"
         android:valueFrom="0.3" android:valueTo="2.5" android:stepSize="0.05"
+        app:labelBehavior="floating" />
+
+    <TextView android:id="@+id/lblSkip" android:text="Skip forward/back (seconds)"
+        android:textAppearance="?attr/textAppearanceTitleSmall"
+        android:layout_width="wrap_content" android:layout_height="wrap_content" />
+    <com.google.android.material.slider.Slider android:id="@+id/sliderSkip"
+        android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:valueFrom="2" android:valueTo="60" android:stepSize="1"
         app:labelBehavior="floating" />
 
     <TextView android:id="@+id/lblPanel" android:text="Browser panel distance"
