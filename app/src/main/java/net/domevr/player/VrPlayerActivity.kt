@@ -206,7 +206,9 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         if (wsum <= 0f) return null
         val ex = FloatArray(n * n); val ey = FloatArray(n * n)
         for (s in same) {
-            val w = settings.shapeWeight(s.id) / 100f / wsum
+            // absolute strength (mean), matching bakeShaping: a lone shape
+            // at 50% previews at half displacement, not full
+            val w = settings.shapeWeight(s.id) / 100f / same.size
             for (j in ex.indices) { ex[j] += w * s.ox[j]; ey[j] += w * s.oy[j] }
         }
         return Triple(ex, ey, n)
@@ -457,6 +459,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         renderer.testSweep = settings.testSweep
         renderer.lensK1 = settings.lensK1
         renderer.lensK2 = settings.lensK2
+        renderer.lensStrength = settings.lensStrength
         renderer.menuAngleUp = settings.menuAngleUp
         renderer.menuAngleDown = settings.menuAngleDown
         renderer.menuSideUp = settings.menuTop
@@ -478,6 +481,8 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         applyOptics()
         renderer.resetBasis("entry") // next sensor reading centers the view
         connections = ConnectionStore(this).load()
+        // re-check the All-files toggle on return from Settings
+        try { refresh() } catch (_: Exception) {}
         glView.onResume()
         rotSensor?.let {
             sensors.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
@@ -737,8 +742,16 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 VrRenderer.BrowserRow.FOLDER, action = "smb:${c.id}")
         }
         r += Row("Internal Storage", "phone storage", VrRenderer.BrowserRow.FOLDER, action = "local:")
+        for (vr in LocalFiles.volumeRoots(this).filter { !it.isPrimary }) {
+            if (LocalFiles.sdBlocked(this, vr.dir))
+                r += Row(vr.label, "tap to grant full access",
+                    VrRenderer.BrowserRow.FOLDER, action = "grantfull:${vr.dir.absolutePath}")
+            else r += Row(vr.label, vr.dir.absolutePath,
+                VrRenderer.BrowserRow.FOLDER, action = "local:${vr.dir.absolutePath}")
+        }
         for (v in SafFiles.removableVolumes(this)) {
             val granted = SafFiles.grantedTree(this, v.uuid) != null
+            if (!LocalFiles.needsFullAccess() && !granted) continue
             r += Row(v.desc, if (granted) "SD card" else "tap to grant access",
                 VrRenderer.BrowserRow.FOLDER, action = "safroot:${v.uuid ?: ""}")
         }
@@ -813,22 +826,22 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun showLocal(dir: File) {
-        pushRows("Internal Storage /${dir.name}", "Listing…",
+        val (label, rel) = LocalFiles.rootTitle(this, dir)
+        pushRows("$label /${dir.name}", "Listing…",
             listOf(Row("Loading…", "", VrRenderer.BrowserRow.FILE)))
         lifecycleScope.launch(Dispatchers.IO) {
             val kids = try { LocalFiles.list(dir) } catch (t: Throwable) { emptyList() }
                 val r = mutableListOf<Row>()
-                val root = LocalFiles.externalRoot()
+                val isRoot = LocalFiles.volumeRoots(this@VrPlayerActivity).any { it.dir == dir }
                 r += Row("⌂ (top)", "servers list", VrRenderer.BrowserRow.FOLDER, action = "home:")
-                r += Row(".. (up)", if (dir == root) "back to servers" else "parent folder", VrRenderer.BrowserRow.FOLDER, action = "up:")
+                r += Row(".. (up)", if (isRoot) "back to servers" else "parent folder", VrRenderer.BrowserRow.FOLDER, action = "up:")
             for (k in kids) {
                 val kind = if (k.isDir) VrRenderer.BrowserRow.FOLDER
                     else VrRenderer.BrowserRow.VIDEO
                 r += Row(k.name, if (k.isDir) "folder" else humanSize(k.size), kind, local = k.file)
             }
             withContext(Dispatchers.Main) {
-                pushRows("Internal Storage ${dir.absolutePath.removePrefix(root.absolutePath).ifEmpty { "/" }}",
-                    "${kids.size} items", r)
+                pushRows("$label $rel", "${kids.size} items", r)
             }
         }
     }
@@ -853,6 +866,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 segLabels = listOf("Normal", "Fisheye"),
                 segActions = listOf("setlens:normal", "setlens:fisheye"),
                 segSelected = if (renderer.projection == Projection.FISHEYE) 1 else 0),
+
             slide("Field of view", "${settings.fovDeg.toInt()}°", "fov", 40f, 110f, settings.fovDeg,
                 VrRenderer.SlideFormat("°", 0, 1f, 0f, 1f)),
             slide("Video size", "${String.format("%.2f", settings.videoZoom)}×", "zoom", 0.3f, 2.5f, settings.videoZoom,
@@ -878,7 +892,16 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 action = "slide:$key", slideKey = key, slideMin = min, slideMax = max, slideVal = cur,
                 slideFmt = fmt)
         val r = mutableListOf<Row>()
-        // Combined preview of the averaged transform (first row, not actionable).
+        // Global lens pre-warp first (above the Combined mesh): drag k1/k2
+        // to 0 and the warp visibly vanishes, which proves the coefficients
+        // are applied. Same keys as before, so dwell/nudge handlers work.
+        r += slide("Lens k1", String.format("%.2f", settings.lensK1), "lensK1", 0f, 1f, settings.lensK1,
+            VrRenderer.SlideFormat("", 2, 1f, 0f, 0.01f))
+        r += slide("Lens k2", String.format("%.2f", settings.lensK2), "lensK2", 0f, 1f, settings.lensK2,
+            VrRenderer.SlideFormat("", 2, 1f, 0f, 0.01f))
+        r += slide("Lens strength", String.format("%.2f×", settings.lensStrength), "lensStrength", 0f, 3f, settings.lensStrength,
+            VrRenderer.SlideFormat("×", 2, 1f, 0f, 0.05f))
+        // Combined preview of the averaged transform (not actionable).
         val avg = averagedShapeOffsets()
         if (avg != null) {
             val (ex, ey, n) = avg
@@ -1074,6 +1097,9 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             "zoom" -> settings.videoZoom = ((0.3f + f * 2.2f) * 20f).roundToInt() / 20f
             "ipd" -> settings.ipdMm = (40f + f * 40f).roundToInt().toFloat().coerceIn(40f, 80f)
             "panel" -> settings.panelDistM = ((1.2f + f * 3.8f) * 10f).roundToInt() / 10f
+            "lensK1" -> settings.lensK1 = ((f * 100f).roundToInt() / 100f).coerceIn(0f, 1f)
+            "lensK2" -> settings.lensK2 = ((f * 100f).roundToInt() / 100f).coerceIn(0f, 1f)
+            "lensStrength" -> settings.lensStrength = ((f * 3f * 20f).roundToInt() / 20f).coerceIn(0f, 3f)
 
             "dwell" -> settings.dwellMs = ((400f + f * 3600f) / 100f).roundToInt() * 100L
             else -> {
@@ -1095,8 +1121,8 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 loc = when (val l = loc) {
                     is Loc.Smb -> if (l.path.isEmpty()) Loc.Root else Loc.Smb(l.connId, l.path.substringBeforeLast('\\', ""))
                     is Loc.Local -> {
-                        val root = LocalFiles.externalRoot()
-                        if (l.dir == root || l.dir.parentFile == null) Loc.Root else Loc.Local(l.dir.parentFile!!)
+                        val isRoot = LocalFiles.volumeRoots(this).any { it.dir == l.dir }
+                        if (isRoot || l.dir.parentFile == null) Loc.Root else Loc.Local(l.dir.parentFile!!)
                     }
                     is Loc.Saf -> if (l.relPath.isEmpty()) Loc.Root
                         else Loc.Saf(l.treeUri, l.relPath.substringBeforeLast('/', ""), l.label)
@@ -1167,10 +1193,21 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             }
             act == "sensors:" -> { loc = Loc.Sensors; yawBaseG = null; yawBaseR = null; yawBaseC = null; turnBaseG = null; turnBaseR = null; resetPeaks(); refresh() }
             act.startsWith("smb:") -> { loc = Loc.Smb(act.removePrefix("smb:"), ""); refresh() }
-            act == "local:" -> {
+            act.startsWith("local:") -> {
                 if (LocalFiles.needsPermission(this)) {
                     toast("Allow videos permission in the 2D app first", long = true)
-                } else loc = Loc.Local(LocalFiles.externalRoot())
+                } else {
+                    val d = File(act.removePrefix("local:"))
+                    if (d.path.isEmpty()) loc = Loc.Local(LocalFiles.externalRoot())
+                    else if (LocalFiles.sdBlocked(this, d)) {
+                        toast("Allow all-files access in the 2D app first", long = true)
+                    } else loc = Loc.Local(d)
+                }
+                refresh()
+            }
+            act.startsWith("grantfull:") -> {
+                // drops to the system Settings toggle; onResume re-checks
+                LocalFiles.requestFullAccess(this)
                 refresh()
             }
             act == "set:proj" -> { cycleProjection(); refresh() }
@@ -1189,6 +1226,9 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                     "zoom" -> settings.videoZoom = (settings.videoZoom + dir * 0.1f).coerceIn(0.3f, 2.5f)
 
                     "panel" -> settings.panelDistM = (settings.panelDistM + dir * 0.2f).coerceIn(1.2f, 5f)
+                    "lensK1" -> settings.lensK1 = (settings.lensK1 + dir * 0.02f).coerceIn(0f, 1f)
+                    "lensK2" -> settings.lensK2 = (settings.lensK2 + dir * 0.02f).coerceIn(0f, 1f)
+                    "lensStrength" -> settings.lensStrength = (settings.lensStrength + dir * 0.1f).coerceIn(0f, 3f)
                     "dwell" -> settings.dwellMs = (settings.dwellMs + dir * 250).coerceIn(400L, 4000L)
                     else -> {
                         if (key.startsWith("shapeWeight-")) {

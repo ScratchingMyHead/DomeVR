@@ -420,6 +420,7 @@ class VrRenderer(
     /** Cardboard lens distortion coefficients (0..1, standard Cardboard). */
     @Volatile var lensK1 = 0.34f
     @Volatile var lensK2 = 0.55f
+    @Volatile var lensStrength = 1f
     // Distortion runs as a FINAL pass on a flat quad (never on scene
     // geometry): warping scene vertices breaks GPU clipping where the
     // dome crosses behind the camera, fanning streaks across the screen.
@@ -440,6 +441,7 @@ class VrRenderer(
     private var uTexDist = 0
     private var uK1Dist = 0
     private var uK2Dist = 0
+    private var uStrengthDist = 0
     private var uLensCDist = 0
     private var uTanDist = 0
     // Cardboard pre-warp geometry (refreshed per frame, no allocation):
@@ -563,11 +565,11 @@ precision mediump float;
 #endif
 varying vec2 vTex;
 uniform sampler2D uTex; uniform float uK1; uniform float uK2;
-uniform vec2 uLensC; uniform vec2 uTanPerUv;
+uniform float uStrength; uniform vec2 uLensC; uniform vec2 uTanPerUv;
 void main(){
   vec2 p = (vTex - uLensC) * uTanPerUv;
   float r2 = dot(p, p);
-  float f = 1.0 + uK1 * r2 + uK2 * r2 * r2;
+  float f = 1.0 + uStrength * (uK1 * r2 + uK2 * r2 * r2);
   vec2 sc = uLensC + (p * f) / uTanPerUv;
   if (sc.x < 0.0 || sc.x > 1.0 || sc.y < 0.0 || sc.y > 1.0) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
   gl_FragColor = texture2D(uTex, sc);
@@ -614,6 +616,7 @@ void main(){
         uTexDist = GLES20.glGetUniformLocation(progDist, "uTex")
         uK1Dist = GLES20.glGetUniformLocation(progDist, "uK1")
         uK2Dist = GLES20.glGetUniformLocation(progDist, "uK2")
+        uStrengthDist = GLES20.glGetUniformLocation(progDist, "uStrength")
         uLensCDist = GLES20.glGetUniformLocation(progDist, "uLensC")
         uTanDist = GLES20.glGetUniformLocation(progDist, "uTanPerUv")
 
@@ -851,9 +854,10 @@ void main(){
         val ty = (tv - 0.5f) * tanPerV
         val rt = kotlin.math.sqrt(tx * tx + ty * ty)
         var rs = rt
+        val st = lensStrength
         for (i in 0 until 4) {
-            val f = rs * (1f + lensK1 * rs * rs + lensK2 * rs * rs * rs * rs) - rt
-            val fp = 1f + 3f * lensK1 * rs * rs + 5f * lensK2 * rs * rs * rs * rs
+            val f = rs * (1f + st * (lensK1 * rs * rs + lensK2 * rs * rs * rs * rs)) - rt
+            val fp = 1f + st * (3f * lensK1 * rs * rs + 5f * lensK2 * rs * rs * rs * rs)
             rs -= f / fp
         }
         val k = if (rt > 1e-6f) rs / rt else 1f
@@ -929,6 +933,7 @@ void main(){
         GLES20.glUniform1i(uTexDist, 0)
         GLES20.glUniform1f(uK1Dist, lensK1)
         GLES20.glUniform1f(uK2Dist, lensK2)
+        GLES20.glUniform1f(uStrengthDist, lensStrength)
         GLES20.glUniform2f(uLensCDist, if (vp == 0) lensCxL else lensCxR, 0.5f)
         GLES20.glUniform2f(uTanDist, tanPerU, tanPerV)
         GLES20.glUniformMatrix4fv(uMvpDist, 1, false, identM, 0)
@@ -1746,7 +1751,9 @@ void main(){
             c.drawLine(nx(j), ny(j), px(j), py(j), p)
         }
         p.style = Paint.Style.FILL
-        // dots: grey unmoved, amber->red moved
+        // dots like shapemesh.py: grey unmoved; moved toward the centre
+        // (dot of displacement vs to-centre vector > eps) green, else red.
+        // Sign-based, so grid-space (y down) works unchanged.
         for (j in mags.indices) {
             val m = mags[j].coerceIn(0f, 1f)
             val x = px(j); val yy = py(j)
@@ -1754,9 +1761,19 @@ void main(){
                 p.color = Color.rgb(170, 170, 170)
                 c.drawCircle(x, yy, 2f, p)
             } else {
+                val ix = (j % n).toFloat() / (n - 1)
+                val iy = (j / n).toFloat() / (n - 1)
+                val dx = pos[j * 2].toFloat() - ix
+                val dy = pos[j * 2 + 1].toFloat() - iy
+                val cx = 0.5f - ix; val cy = 0.5f - iy
                 val t = m.coerceAtLeast(0.15f)
-                p.color = Color.rgb(255, (200 - 170 * t).toInt(), (60 - 40 * t).toInt())
-                c.drawCircle(x, yy, 2f + 3f * t, p)
+                val inward = (dx * dx + dy * dy) > 1e-18f &&
+                    (cx * cx + cy * cy) > 1e-18f && (dx * cx + dy * cy) > 1e-9f
+                if (inward)
+                    p.color = Color.rgb((120 - 90 * t).toInt(), (200 - 20 * t).toInt(), (120 - 90 * t).toInt())
+                else
+                    p.color = Color.rgb(255, (200 - 170 * t).toInt(), (60 - 40 * t).toInt())
+                c.drawCircle(x, yy, 2f + 4f * t, p)
             }
         }
         p.strokeWidth = 1f
@@ -2147,15 +2164,18 @@ void main(){
 
     /** Bake the normalized weighted-average shaping grid into the video mesh
      *  UVs (texture space, so head tracking via MVP is unaffected). Mesh UVs
-     *  are per-half-frame: u right, v up (GL origin). Grid space is y down,
-     *  so grid_v = 1 - v and dy flips sign on write. No-op when nothing
-     *  enabled (identity = same sampling as unwarped). */
+     *  are per-half-frame: u right, v up (GL origin). Grid offsets are
+     *  DISPLAY displacements (where content goes, y down) but sampling
+     *  needs the opposite: to move content toward center you sample from
+     *  outside, so the write NEGATES (Skinny authored narrower rendered
+     *  wider before this fix). Grid space is y down, so grid_v = 1 - v
+     *  and the y write is v + dy. No-op when nothing enabled. */
     private fun bakeShaping(m: Mesh): Mesh {
         val active = shapingActive
         if (active.isEmpty()) return m
         val n = active[0].n
-        var wsum = 0f
-        for (a in active) if (a.n == n) wsum += a.weight01
+        var wsum = 0f; var wcnt = 0
+        for (a in active) if (a.n == n) { wsum += a.weight01; wcnt++ }
         if (wsum <= 0f) return m
         // Combine on the fly per vertex (meshes are small: 25x49 sphere, 25x13 flat).
         val count = m.tex.capacity() / 2
@@ -2172,7 +2192,11 @@ void main(){
             val fx = gx - x0; val fy = gv - y0
             for (a in active) {
                 if (a.n != n) continue
-                val w = a.weight01 / wsum
+                // MEAN of weighted offsets (not normalized average): weights
+                // are absolute opacities, so a lone shape at 50% gives half
+                // displacement. (Normalized average pinned every nonzero
+                // weight to full strength — the slider did nothing.)
+                val w = a.weight01 / wcnt
                 fun at(ix: Int, iy: Int, arr: FloatArray) = arr[iy * n + ix]
                 val ox = (at(x0, y0, a.ox) * (1 - fx) + at(x0 + 1, y0, a.ox) * fx) * (1 - fy) +
                          (at(x0, y0 + 1, a.ox) * (1 - fx) + at(x0 + 1, y0 + 1, a.ox) * fx) * fy
@@ -2180,8 +2204,8 @@ void main(){
                          (at(x0, y0 + 1, a.oy) * (1 - fx) + at(x0 + 1, y0 + 1, a.oy) * fx) * fy
                 dx += w * ox; dy += w * oy
             }
-            out[k * 2] = u + dx
-            out[k * 2 + 1] = v - dy
+            out[k * 2] = u - dx
+            out[k * 2 + 1] = v + dy
         }
         m.tex.rewind()
         return Mesh(m.verts, fb(out), m.indices, m.indexCount)

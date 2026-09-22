@@ -65,6 +65,15 @@
         android:valueFrom="0" android:valueTo="1" android:stepSize="0.01"
         app:labelBehavior="floating" />
 
+    <TextView android:id="@+id/lblLensStrength" android:text="Lens strength"
+        android:textAppearance="?attr/textAppearanceTitleSmall"
+        android:layout_width="wrap_content" android:layout_height="wrap_content"
+        android:paddingTop="12dp" />
+    <com.google.android.material.slider.Slider android:id="@+id/sliderLensStrength"
+        android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:valueFrom="0" android:valueTo="3" android:stepSize="0.05"
+        app:labelBehavior="floating" />
+
     <TextView android:id="@+id/lblMenuAngleUp" android:text="Play-menu look-up angle"
         android:textAppearance="?attr/textAppearanceTitleSmall"
         android:layout_width="wrap_content" android:layout_height="wrap_content"

@@ -148,6 +148,12 @@ class SettingsStore(ctx: Context) {
     var lensK2: Float
         get() = p.getFloat("lens_k2", 0.55f).coerceIn(0f, 1f)
         set(v) { p.edit().putFloat("lens_k2", v).apply() }
+    /** Master strength for the whole pre-warp (1 = physical, 0 = off).
+     *  Absorbs viewer profile error, eye-to-screen error and xdpi skew
+     *  in one knob: f = 1 + S*(K1*r^2 + K2*r^4). */
+    var lensStrength: Float
+        get() = p.getFloat("lens_strength", 1f).coerceIn(0f, 3f)
+        set(v) { p.edit().putFloat("lens_strength", v).apply() }
     /** Look-up tilt (deg, 10..60) that opens the VR play menu when it is on top. */
     var menuAngleUp: Float
         get() = p.getFloat("menu_angle_up",

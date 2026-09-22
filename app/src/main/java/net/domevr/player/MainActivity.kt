@@ -55,8 +55,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fileAdapter: FileAdapter
 
     private val permLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) openLocalRoot() else Toast.makeText(this, "Videos permission needed for Internal Storage", Toast.LENGTH_LONG).show()
+        if (granted) {
+            val p = pendingSdPath; pendingSdPath = null
+            if (p != null) openSdDirect(p) else openLocalRoot()
+        } else Toast.makeText(this, "Videos permission needed for Internal Storage", Toast.LENGTH_LONG).show()
     }
+    /** SD path awaiting the media permission before the full-access check. */
+    private var pendingSdPath: String? = null
 
     // SAF (SD card) folder picker state: volume awaiting a grant.
     private var pendingSafVolume: String? = null
@@ -129,6 +134,8 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         StreamProxy.start()
         connections = store.load()
+        // re-check the All-files toggle on return from Settings
+        renderWatch()
     }
 
     // ---------- Watch ----------
@@ -193,7 +200,10 @@ class MainActivity : AppCompatActivity() {
             val c = connections.find { it.id == l.connId }
             "/${c?.label ?: "?"}${if (l.path.isEmpty()) "" else "/${l.path}".replace('\\', '/')}"
         }
-        is WLoc.Local -> "/Internal Storage${l.dir.absolutePath.removePrefix(LocalFiles.externalRoot().absolutePath).ifEmpty { "/" }}"
+        is WLoc.Local -> {
+            val (label, rel) = LocalFiles.rootTitle(this, l.dir)
+            "/$label$rel"
+        }
     }
 
     private fun renderWatch() {
@@ -204,7 +214,19 @@ class MainActivity : AppCompatActivity() {
                 val items = mutableListOf<WatchEntry>()
                 connections.forEach { items += WatchEntry.RootConn(it) }
                 items += WatchEntry.RootLocal
-                SafFiles.removableVolumes(this).forEach { items += WatchEntry.SdVolume(it.desc, it.uuid) }
+                // SD via direct File (uuid field carries the absolute path);
+                // SAF rows only survive where direct access is blocked or
+                // a legacy grant already exists.
+                for (vr in LocalFiles.volumeRoots(this).filter { !it.isPrimary }) {
+                    val blocked = LocalFiles.sdBlocked(this, vr.dir)
+                    items += WatchEntry.SdVolume(
+                        if (blocked) "${vr.label} (tap to grant access)" else vr.label,
+                        vr.dir.absolutePath)
+                }
+                for (v in SafFiles.removableVolumes(this)) {
+                    if (!LocalFiles.needsFullAccess() && SafFiles.grantedTree(this, v.uuid) == null) continue
+                    items += WatchEntry.SdVolume(v.desc, v.uuid)
+                }
                 fileAdapter.submit(items)
             }
             is WLoc.Saf -> {
@@ -266,8 +288,8 @@ class MainActivity : AppCompatActivity() {
             is WLoc.Saf -> if (l.relPath.isEmpty()) WLoc.Root
                 else WLoc.Saf(l.treeUri, l.relPath.substringBeforeLast('/', ""), l.label)
             is WLoc.Local -> {
-                val root = LocalFiles.externalRoot()
-                if (l.dir == root || l.dir.parentFile == null) WLoc.Root else WLoc.Local(l.dir.parentFile!!)
+                val isRoot = LocalFiles.volumeRoots(this).any { it.dir == l.dir }
+                if (isRoot || l.dir.parentFile == null) WLoc.Root else WLoc.Local(l.dir.parentFile!!)
             }
         }
         renderWatch()
@@ -284,7 +306,12 @@ class MainActivity : AppCompatActivity() {
             is WatchEntry.Up -> watchUp()
             is WatchEntry.RootConn -> { wloc = WLoc.Smb(e.conn.id, ""); renderWatch() }
             is WatchEntry.RootLocal -> openLocalRoot()
-            is WatchEntry.SdVolume -> openSafVolume(SafFiles.VolumeInfo(e.uuid, e.desc))
+            // SdVolume.uuid carries an absolute path for direct-File SD
+            // rows, or a volume uuid for legacy SAF rows.
+            is WatchEntry.SdVolume -> {
+                val u = e.uuid ?: ""
+                if (u.startsWith("/")) openSdDirect(u) else openSafVolume(SafFiles.VolumeInfo(e.uuid, e.desc))
+            }
             is WatchEntry.Smb -> if (e.e.isDir) { wloc = WLoc.Smb((wloc as WLoc.Smb).connId, e.e.path); renderWatch() }
             is WatchEntry.Local -> if (e.e.isDir) { wloc = WLoc.Local(e.e.file); renderWatch() }
             is WatchEntry.Saf -> if (e.e.isDir) {
@@ -302,9 +329,24 @@ class MainActivity : AppCompatActivity() {
         wloc = WLoc.Local(LocalFiles.externalRoot()); renderWatch()
     }
 
+    /** Open an SD volume root directly; fires the media permission, then
+     *  the All-files settings toggle, only when each is actually missing. */
+    private fun openSdDirect(path: String) {
+        if (LocalFiles.needsPermission(this)) {
+            pendingSdPath = path
+            permLauncher.launch(LocalFiles.requestPermission()); return
+        }
+        val dir = java.io.File(path)
+        if (LocalFiles.sdBlocked(this, dir)) { LocalFiles.requestFullAccess(this); return }
+        wloc = WLoc.Local(dir); renderWatch()
+    }
+
     private fun playWatchEntry(e: WatchEntry) {
         when (e) {
-            is WatchEntry.SdVolume -> openSafVolume(SafFiles.VolumeInfo(e.uuid, e.desc))
+            is WatchEntry.SdVolume -> {
+                val u = e.uuid ?: ""
+                if (u.startsWith("/")) openSdDirect(u) else openSafVolume(SafFiles.VolumeInfo(e.uuid, e.desc))
+            }
             is WatchEntry.Saf -> {
                 if (!SafFiles.isVideo(e.e)) { Toast.makeText(this, "Only video files play", Toast.LENGTH_SHORT).show(); return }
                 val sibs = try {
@@ -521,6 +563,7 @@ class MainActivity : AppCompatActivity() {
         bindSlider(v, R.id.sliderSkip, R.id.lblSkip, settings.skipSecs.toFloat(), "Skip forward/back", "s") { settings.skipSecs = it.toInt() }
         bindSlider(v, R.id.sliderLensK1, R.id.lblLensK1, settings.lensK1, "Lens distortion k1", "") { settings.lensK1 = it }
         bindSlider(v, R.id.sliderLensK2, R.id.lblLensK2, settings.lensK2, "Lens distortion k2", "") { settings.lensK2 = it }
+        bindSlider(v, R.id.sliderLensStrength, R.id.lblLensStrength, settings.lensStrength, "Lens strength", "×") { settings.lensStrength = it }
         bindSlider(v, R.id.sliderMenuAngleUp, R.id.lblMenuAngleUp, settings.menuAngleUp, "Play-menu look-up angle", "°") { settings.menuAngleUp = it }
         bindSlider(v, R.id.sliderMenuAngleDown, R.id.lblMenuAngleDown, -settings.menuAngleDown, "Play-menu look-down angle", "°") { settings.menuAngleDown = -it }
         bindSlider(v, R.id.sliderPanel, R.id.lblPanel, settings.panelDistM, "Browser panel distance", "m") { settings.panelDistM = it }
@@ -626,7 +669,9 @@ class MainActivity : AppCompatActivity() {
                     h.itemView.setOnClickListener { onClick(e) }
                 }
                 is WatchEntry.SdVolume -> {
-                    h.name.text = e.desc; h.meta.text = "SD card"; h.icon.text = "💾"
+                    h.name.text = e.desc
+                    h.meta.text = if ((e.uuid ?: "").startsWith("/")) e.uuid else "SD card"
+                    h.icon.text = "💾"
                     h.scan.visibility = View.GONE
                     h.itemView.setOnClickListener { onClick(e) }
                 }
