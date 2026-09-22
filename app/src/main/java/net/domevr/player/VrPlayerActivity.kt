@@ -443,8 +443,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         renderer.dwellMs = settings.dwellMs
         renderer.pinVideo = settings.pinVideo
         renderer.skipSecs = settings.skipSecs
-        renderer.domeStretchK = settings.domeStretchK
-        renderer.domeOnset = settings.domeOnset
+
         // Shaping grids: feed active set only when content changed (mesh rebuild is keyed).
         val skey = shapingShapes.filter { settings.shapeEnabled(it.id) }
             .joinToString(";") { "${it.id}:${settings.shapeWeight(it.id)}" }
@@ -467,6 +466,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         // apart. o = 1 - ipd/spacing (NDC units), clamped to stay on-screen.
         val dm = resources.displayMetrics
         val pxPerMm = (dm.xdpi / 25.4f).coerceAtLeast(1f)
+        renderer.mmPerPx = 1f / pxPerMm
         val halfPx = (if (renderer.lastWidth > 100) renderer.lastWidth else dm.widthPixels) / 2f
         val spacingMm = (halfPx / pxPerMm).coerceAtLeast(1f)
         renderer.convShiftNdc = ((1f - settings.ipdMm / spacingMm).coerceIn(-0.5f, 0.5f))
@@ -857,10 +857,6 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 VrRenderer.SlideFormat("°", 0, 1f, 0f, 1f)),
             slide("Video size", "${String.format("%.2f", settings.videoZoom)}×", "zoom", 0.3f, 2.5f, settings.videoZoom,
                 VrRenderer.SlideFormat("×", 2, 1f, 0f, 0.05f)),
-            slide("Edge stretch onset", "${((0.5f - settings.domeOnset) * 100).toInt()}% from edge", "domeOnset", 0f, 0.45f, settings.domeOnset,
-                VrRenderer.SlideFormat("% from edge", 0, -100f, 50f, 0.01f)),
-            slide("Edge stretch strength", "${(settings.domeStretchK * 100).toInt()}%", "domeStretch", 0f, 3f, settings.domeStretchK,
-                VrRenderer.SlideFormat("%", 0, 100f, 0f, 0.01f)),
             Row("", "", VrRenderer.BrowserRow.FILE, dead = true),
             slide("Eye separation", "${settings.ipdMm.toInt()} mm", "ipd", 40f, 80f, settings.ipdMm,
                 VrRenderer.SlideFormat(" mm", 0, 1f, 0f, 1f)),
@@ -1078,8 +1074,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             "zoom" -> settings.videoZoom = ((0.3f + f * 2.2f) * 20f).roundToInt() / 20f
             "ipd" -> settings.ipdMm = (40f + f * 40f).roundToInt().toFloat().coerceIn(40f, 80f)
             "panel" -> settings.panelDistM = ((1.2f + f * 3.8f) * 10f).roundToInt() / 10f
-            "domeOnset" -> settings.domeOnset = ((f * 0.45f) * 100f).roundToInt() / 100f
-            "domeStretch" -> settings.domeStretchK = ((f * 3f) * 100f).roundToInt() / 100f
+
             "dwell" -> settings.dwellMs = ((400f + f * 3600f) / 100f).roundToInt() * 100L
             else -> {
                 // per-shape weight sliders: slideKey "shapeWeight-<slug>"
@@ -1192,8 +1187,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                     "fov" -> settings.fovDeg = (settings.fovDeg + dir * 2f).coerceIn(40f, 110f)
                     "ipd" -> settings.ipdMm = (settings.ipdMm + dir * 1f).coerceIn(40f, 80f)
                     "zoom" -> settings.videoZoom = (settings.videoZoom + dir * 0.1f).coerceIn(0.3f, 2.5f)
-                    "domeOnset" -> settings.domeOnset = (settings.domeOnset + dir * 0.02f).coerceIn(0f, 0.45f)
-                    "domeStretch" -> settings.domeStretchK = (settings.domeStretchK + dir * 0.1f).coerceIn(0f, 3f)
+
                     "panel" -> settings.panelDistM = (settings.panelDistM + dir * 0.2f).coerceIn(1.2f, 5f)
                     "dwell" -> settings.dwellMs = (settings.dwellMs + dir * 250).coerceIn(400L, 4000L)
                     else -> {

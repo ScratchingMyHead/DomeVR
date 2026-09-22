@@ -48,10 +48,6 @@ class VrRenderer(
 
     @Volatile var mode: Mode = Mode.BROWSER
     @Volatile var projection: Projection = Projection.DEG180
-    /** Vertical stretch at poles for DEG180: 0 = linear, 0.45 ≈ 45% more top/bottom FOV. */
-    @Volatile var domeStretchK: Float = 0.45f
-    /** Stretch onset: half-height |p| where stretch starts (0.30 = 20% from top/bottom). */
-    @Volatile var domeOnset: Float = 0.30f
     @Volatile var stereo: Stereo = Stereo.SBS
     @Volatile var fovDeg: Float = 68f
     @Volatile var eyeHalfM: Float = 0.032f
@@ -444,7 +440,17 @@ class VrRenderer(
     private var uTexDist = 0
     private var uK1Dist = 0
     private var uK2Dist = 0
-    private var uAspectDist = 0
+    private var uLensCDist = 0
+    private var uTanDist = 0
+    // Cardboard pre-warp geometry (refreshed per frame, no allocation):
+    // tan-angle per quad-UV unit + per-eye optical centers in quad UV.
+    // Eye-to-screen 84.3mm = Cardboard v1 eye-to-lens (~45) + screen-to-lens
+    // (39.3). r = offset_m / eyeToScreen is what K1/K2 are calibrated in.
+    private var tanPerU = 0.65f
+    private var tanPerV = 0.74f
+    private var lensCxL = 0.42f
+    private var lensCxR = 0.58f
+    @Volatile var mmPerPx = 0.15f
     private val identM = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
     private val flatM = FloatArray(16) // proj · eff: rotation-only UI matrix
     private val mvpM = FloatArray(16)
@@ -456,6 +462,9 @@ class VrRenderer(
     companion object {
         const val VISIBLE_ROWS = 13
         const val MENU_BUTTONS = 14
+        // Cardboard v1 eye-to-screen distance (mm). r_tanAngle = offset_m /
+        // eyeToScreen is the unit system the distortion coefficients live in.
+        private const val EYE_TO_SCREEN_MM = 84.3f
         const val TEX = 1024
         const val ROWS_Y0 = 150
         const val ROW_H = 64
@@ -519,10 +528,17 @@ precision mediump float;
 varying vec2 vTex; uniform sampler2D uTex;
 void main(){ gl_FragColor = texture2D(uTex, vTex); }
 """
-        // Final-pass lens warp (per-pixel, on a flat quad at safe depth):
-        // radial barrel offsets the sample outward (edges magnified, like
-        // the real lens); sampling outside the eye image paints black,
-        // carving the curved lens boundary. k1/k2 span 0..1.
+        // Final-pass Cardboard lens pre-warp (per-pixel, flat quad at safe
+        // depth): Brown-Conrady radial, r in TAN-ANGLE units from this
+        // eye's optical center — not normalized pixels from image center.
+        // The physical lens magnifies with radius (pincushion), so the
+        // pre-warp samples the texture FARTHER out (forward polynomial).
+        // Cardboard's distortInverse() is the same mapping walked the
+        // other way (mesh verts live in texture space, texture->screen);
+        // a screen-space fragment shader walks screen->texture, which is
+        // the plain forward r*(1+K1*r^2+K2*r^4) — no Newton solve needed.
+        // Sampling outside the eye image paints black, carving the curved
+        // lens boundary. K1=K2=0 is exactly identity (proves the geometry).
         private const val FRAG_DIST = """
 #ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
@@ -530,13 +546,13 @@ precision highp float;
 precision mediump float;
 #endif
 varying vec2 vTex;
-uniform sampler2D uTex; uniform float uK1; uniform float uK2; uniform float uAspect;
+uniform sampler2D uTex; uniform float uK1; uniform float uK2;
+uniform vec2 uLensC; uniform vec2 uTanPerUv;
 void main(){
-  vec2 c = vTex - vec2(0.5);
-  vec2 d = vec2(c.x * uAspect, c.y);
-  float r2 = dot(d, d);
-  float s = 1.0 + uK1 * r2 + uK2 * r2 * r2;
-  vec2 sc = vec2(0.5) + vec2(d.x * s / uAspect, d.y * s);
+  vec2 p = (vTex - uLensC) * uTanPerUv;
+  float r2 = dot(p, p);
+  float f = 1.0 + uK1 * r2 + uK2 * r2 * r2;
+  vec2 sc = uLensC + (p * f) / uTanPerUv;
   if (sc.x < 0.0 || sc.x > 1.0 || sc.y < 0.0 || sc.y > 1.0) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
   gl_FragColor = texture2D(uTex, sc);
 }
@@ -582,7 +598,8 @@ void main(){
         uTexDist = GLES20.glGetUniformLocation(progDist, "uTex")
         uK1Dist = GLES20.glGetUniformLocation(progDist, "uK1")
         uK2Dist = GLES20.glGetUniformLocation(progDist, "uK2")
-        uAspectDist = GLES20.glGetUniformLocation(progDist, "uAspect")
+        uLensCDist = GLES20.glGetUniformLocation(progDist, "uLensC")
+        uTanDist = GLES20.glGetUniformLocation(progDist, "uTanPerUv")
 
         val tex = IntArray(1)
         GLES20.glGenTextures(1, tex, 0)
@@ -685,8 +702,7 @@ void main(){
         Matrix.perspectiveM(projM, 0, fovDeg.coerceIn(40f, 110f), (w / 2f) / h, 0.1f, 100f)
         Matrix.perspectiveM(videoProjM, 0, fovDeg.coerceIn(40f, 110f), (w / 2f) / h, 0.1f, 100f)
         val cur: Mode = mode
-        val wantMeshKey = projection.name + "|k=" + domeStretchK.toString() + "|o=" + domeOnset.toString() +
-            "|sh=" + shapingRevision.toString()
+        val wantMeshKey = projection.name + "|sh=" + shapingRevision.toString()
         if (meshKey != wantMeshKey) {
             mesh = buildMesh(projection); meshKey = wantMeshKey
         }
@@ -730,6 +746,7 @@ void main(){
             // distortion quad resamples it with barrel UVs. Flat quad =
             // no clipping boundary issues, unlike warping scene verts.
             // The pointer draws after, in screen space, staying round.
+            refreshWarpDims(w, h)
             val fw = w / 2 * FBO_SCALE; val fh = h * FBO_SCALE
             // Physical eye-halves are ~0.8-1.4 aspect. Clamp: a bogus
             // measurement must never reach the warp.
@@ -750,7 +767,7 @@ void main(){
                 GLES20.glGenerateMipmap(GLES20.GL_TEXTURE_2D)
                 GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
                 GLES20.glViewport(vp * w / 2, 0, w / 2, h)
-                drawDistortionQuad(eyeAspect)
+                drawDistortionQuad(vp)
             } else {
                 GLES20.glViewport(vp * w / 2, 0, w / 2, h)
                 if (cur == Mode.VIDEO) drawVideo(eye, warpCx, eyeAspect)
@@ -762,16 +779,16 @@ void main(){
             // The pointer is then re-warped to the displayed position
             // (see drawScreenPointer): seen and computed agree.
             if (cur == Mode.VIDEO && menuOpen && menuStickyValid)
-                drawScreenPointer(menuStickyW[0], menuStickyW[1], menuStickyW[2], flatM, eyeAspect, menuDwellProg())
+                drawScreenPointer(menuStickyW[0], menuStickyW[1], menuStickyW[2], flatM, eyeAspect, menuDwellProg(), vp = vp)
             // recenter aim pointer: blue twin, 2x size, 2x dwell to a point
             if (cur == Mode.VIDEO && aimArmed)
                 drawScreenPointer(aimW[0], aimW[1], aimW[2], flatM, eyeAspect,
-                    aimProg.coerceIn(0f, 1f), 2f, aimTexId)
+                    aimProg.coerceIn(0f, 1f), 2f, aimTexId, vp)
             // screen-space pointer, re-warped to the displayed position:
             // project the world hit with this eye's rotation-only matrix
             if (cur == Mode.BROWSER && hitValid)
                 drawScreenPointer(hitX, hitY, hitZ, flatM, eyeAspect,
-                    if (inXZone) xProgF.coerceIn(0f, 1f) else browserDwellProg())
+                    if (inXZone) xProgF.coerceIn(0f, 1f) else browserDwellProg(), vp = vp)
             drawToast()
         }
     }
@@ -802,21 +819,34 @@ void main(){
      *  the half-centers (±0.5) lands a quarter-screen off and doubles. */
     private fun drawScreenPointer(
         wx: Float, wy: Float, wz: Float, mat: FloatArray, aspect: Float, prog: Float,
-        sizeMul: Float = 1f, texId: Int = -1
+        sizeMul: Float = 1f, texId: Int = -1, vp: Int = 0
     ) {
         v4[0] = wx; v4[1] = wy; v4[2] = wz; v4[3] = 1f
         Matrix.multiplyMV(clipV, 0, mat, 0, v4, 0)
         val cw = clipV[3]
         if (cw <= 0.01f) return
-        // work in distortion-quad texel units, mirroring FRAG_DIST exactly
+        // panel UV (undistorted FBO space) -> screen UV, mirroring FRAG_DIST
+        // in the opposite direction: texture->screen IS the distortInverse
+        // root solve (Newton, 4 iters — trivial for a point or two a frame)
         val tu = clipV[0] / cw * 0.5f + 0.5f
         val tv = clipV[1] / cw * 0.5f + 0.5f
-        val dx = (tu - 0.5f) * aspect
-        val dy = tv - 0.5f
-        val r2 = dx * dx + dy * dy
-        val s = 1f / (1f + lensK1 * r2 + lensK2 * r2 * r2)
-        var nx = (0.5f + dx * s / aspect) * 2f - 1f
-        var ny = (0.5f + dy * s) * 2f - 1f
+        val cx = if (vp == 0) lensCxL else lensCxR
+        val tx = (tu - cx) * tanPerU
+        val ty = (tv - 0.5f) * tanPerV
+        val rt = kotlin.math.sqrt(tx * tx + ty * ty)
+        var rs = rt
+        for (i in 0 until 4) {
+            val f = rs * (1f + lensK1 * rs * rs + lensK2 * rs * rs * rs * rs) - rt
+            val fp = 1f + 3f * lensK1 * rs * rs + 5f * lensK2 * rs * rs * rs * rs
+            rs -= f / fp
+        }
+        val k = if (rt > 1e-6f) rs / rt else 1f
+        val su = cx + tx * k / tanPerU
+        val sv = 0.5f + ty * k / tanPerV
+        // the distortion quad is fullscreen (-1..1) under a HALF viewport,
+        // so its center is NDC (0,0) per eye
+        var nx = su * 2f - 1f
+        var ny = sv * 2f - 1f
         if (nx < -1.2f || nx > 1.2f || ny < -1.2f || ny > 1.2f) return
         val sx = 0.022f * sizeMul * (1f - 0.85f * prog)
         val sy = sx * aspect
@@ -859,14 +889,32 @@ void main(){
 
     /** Fullscreen quad resampling the eye FBO with barrel UVs. Flat quad
      *  at safe depth: no clipping-boundary issues by construction. */
-    private fun drawDistortionQuad(aspect: Float) {
+    /** Per-eye optical centers in quad UV (phone center = inner edge of
+     *  each half; lens sits IPD/2 from phone center). Refreshed per frame
+     *  from the live surface size, display density and IPD — narrow phones
+     *  genuinely put the centers near the outer edges, that is correct. */
+    private fun refreshWarpDims(w: Int, h: Int) {
+        val mmPx = mmPerPx
+        if (mmPx <= 0f) return
+        val halfWmm = (w / 2f) * mmPx
+        val fullHmm = h.toFloat() * mmPx
+        if (halfWmm <= 0f || fullHmm <= 0f) return
+        tanPerU = halfWmm / EYE_TO_SCREEN_MM
+        tanPerV = fullHmm / EYE_TO_SCREEN_MM
+        val k = (eyeHalfM * 1000f / halfWmm).coerceIn(0.02f, 0.98f)
+        lensCxL = 1f - k
+        lensCxR = k
+    }
+
+    private fun drawDistortionQuad(vp: Int) {
         GLES20.glUseProgram(progDist)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTexId)
         GLES20.glUniform1i(uTexDist, 0)
         GLES20.glUniform1f(uK1Dist, lensK1)
         GLES20.glUniform1f(uK2Dist, lensK2)
-        GLES20.glUniform1f(uAspectDist, aspect)
+        GLES20.glUniform2f(uLensCDist, if (vp == 0) lensCxL else lensCxR, 0.5f)
+        GLES20.glUniform2f(uTanDist, tanPerU, tanPerV)
         GLES20.glUniformMatrix4fv(uMvpDist, 1, false, identM, 0)
         val v = floatArrayOf(-1f, -1f, 0f, -1f, 1f, 0f, 1f, -1f, 0f, 1f, 1f, 0f)
         val t = floatArrayOf(0f, 0f, 0f, 1f, 1f, 0f, 1f, 1f)
@@ -2073,7 +2121,7 @@ void main(){
                 24, 12
             )
             Projection.FISHEYE -> sphereSegment(180f, flipX = true)
-            Projection.DEG180 -> sphereSegment(180f, stretchK = domeStretchK)
+            Projection.DEG180 -> sphereSegment(180f)
             Projection.DEG220 -> sphereSegment(220f)
             Projection.DEG270 -> sphereSegment(270f)
             Projection.DEG360 -> sphereSegment(360f)
@@ -2123,23 +2171,16 @@ void main(){
         return Mesh(m.verts, fb(out), m.indices, m.indexCount)
     }
 
-    private fun sphereSegment(deg: Float, flipX: Boolean = false, stretchK: Float = 0f): Mesh {
+    private fun sphereSegment(deg: Float, flipX: Boolean = false): Mesh {
         val rows = 24; val cols = 48
         val r = 8f
         val yawMax = Math.toRadians((deg / 2).toDouble())
         val verts = mutableListOf<Float>(); val texs = mutableListOf<Float>()
         for (iy in 0..rows) {
             val v = iy.toFloat() / rows
-            // Vertical stretch: dead-zone |p|<onset (onset 0.30 = starts 20% from top/bottom),
-            // fast ramp to poles. Centre v=0.5 stays at pitch 0; poles stretched by (1+k).
-            val p = v - 0.5f
-            val absP = kotlin.math.abs(p)
-            val onset = domeOnset.coerceIn(0f, 0.45f)
-            val width = (0.5f - onset).coerceAtLeast(0.05f)
-            val t = ((absP - onset) / width).coerceIn(0f, 1f)
-            val s = 1f - (1f - t) * (1f - t)
-            val stretch = 1f + stretchK * s
-            val pitch = Math.PI * p * stretch
+            // Linear pitch mapping (edge stretch removed: the Cardboard
+            // pre-warp now owns all edge geometry). Centre v=0.5 = pitch 0.
+            val pitch = Math.PI * (v - 0.5f)
             for (ix in 0..cols) {
                 val u = ix.toFloat() / cols
                 val yaw = -yawMax + u * 2 * yawMax

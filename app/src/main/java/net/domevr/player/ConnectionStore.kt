@@ -118,15 +118,7 @@ class SettingsStore(ctx: Context) {
     var safTrees: Set<String>
         get() = p.getStringSet("saf_trees", emptySet())?.toSet() ?: emptySet()
         set(v) { p.edit().putStringSet("saf_trees", v.toSet()).apply() }
-    /** DEG180 vertical stretch onset: half-height |p| where stretch starts.
-     *  Displayed as % from top/bottom edge = (0.5 - onset) * 100. */
-    var domeOnset: Float
-        get() = p.getFloat("dome_onset", 0.30f).coerceIn(0f, 0.45f)
-        set(v) { p.edit().putFloat("dome_onset", v).apply() }
-    /** DEG180 vertical stretch strength at poles (0 = linear, 3.0 = insane). */
-    var domeStretchK: Float
-        get() = p.getFloat("dome_stretch", 0.45f).coerceIn(0f, 3f)
-        set(v) { p.edit().putFloat("dome_stretch", v).apply() }
+
     /** Pin video in front of the viewer (screen lock); off = look-around. */
     var pinVideo: Boolean
         get() = p.getBoolean("pin_video", false)
