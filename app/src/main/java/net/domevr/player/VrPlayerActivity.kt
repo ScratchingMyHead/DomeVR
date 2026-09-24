@@ -459,7 +459,11 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         renderer.testSweep = settings.testSweep
         renderer.lensK1 = settings.lensK1
         renderer.lensK2 = settings.lensK2
+        renderer.lensK3 = settings.lensK3
+        renderer.lensCy = settings.lensCy
         renderer.lensStrength = settings.lensStrength
+        renderer.fisheyeRadiusScale = settings.fisheyeRadius
+        renderer.fisheyeMirrorR = settings.fisheyeMirrorR
         renderer.menuAngleUp = settings.menuAngleUp
         renderer.menuAngleDown = settings.menuAngleDown
         renderer.menuSideUp = settings.menuTop
@@ -473,6 +477,13 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         val halfPx = (if (renderer.lastWidth > 100) renderer.lastWidth else dm.widthPixels) / 2f
         val spacingMm = (halfPx / pxPerMm).coerceAtLeast(1f)
         renderer.convShiftNdc = ((1f - settings.ipdMm / spacingMm).coerceIn(-0.5f, 0.5f))
+        // Fisheye circle calibration needs the decoded frame's aspect.
+        try {
+            player?.videoFormat?.let { vf ->
+                if (vf.width > 0 && vf.height > 0)
+                    renderer.videoAspect = vf.width.toFloat() / vf.height.toFloat()
+            }
+        } catch (_: Exception) {}
     }
 
     override fun onResume() {
@@ -866,6 +877,9 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 segLabels = listOf("Normal", "Fisheye"),
                 segActions = listOf("setlens:normal", "setlens:fisheye"),
                 segSelected = if (renderer.projection == Projection.FISHEYE) 1 else 0),
+            slide("Fisheye radius", "${String.format("%.2f", settings.fisheyeRadius)}×", "fishR", 0.5f, 1.5f, settings.fisheyeRadius,
+                VrRenderer.SlideFormat("×", 2, 1f, 0f, 0.01f)),
+            Row("Mirror right fisheye", if (settings.fisheyeMirrorR) "ON" else "off", VrRenderer.BrowserRow.ACTION, action = "set:fishmirror"),
 
             slide("Field of view", "${settings.fovDeg.toInt()}°", "fov", 40f, 110f, settings.fovDeg,
                 VrRenderer.SlideFormat("°", 0, 1f, 0f, 1f)),
@@ -901,6 +915,10 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             VrRenderer.SlideFormat("", 2, 1f, 0f, 0.01f))
         r += slide("Lens strength", String.format("%.2f×", settings.lensStrength), "lensStrength", 0f, 3f, settings.lensStrength,
             VrRenderer.SlideFormat("×", 2, 1f, 0f, 0.05f))
+        r += slide("Lens k3", String.format("%.2f", settings.lensK3), "lensK3", 0f, 1f, settings.lensK3,
+            VrRenderer.SlideFormat("", 2, 1f, 0f, 0.01f))
+        r += slide("Lens center Y", String.format("%.2f", settings.lensCy), "lensCy", 0.3f, 0.7f, settings.lensCy,
+            VrRenderer.SlideFormat("", 2, 1f, 0f, 0.01f))
         // Combined preview of the averaged transform (not actionable).
         val avg = averagedShapeOffsets()
         if (avg != null) {
@@ -991,7 +1009,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             Row("MAG ${f(mg[0])} ${f(mg[1])} ${f(mg[2])}", "|m|=${String.format("%.0f", mmag)} — still~=const", VrRenderer.BrowserRow.ACTION),
             Row("GAMErv ${yprOf(lastTrackM)}", if (useGameRv) "tracking source" else "compare source", VrRenderer.BrowserRow.ACTION),
             Row("FULLrv ${yprOf(cmpListener.lastRaw)}", if (useGameRv) "compare source" else "tracking source", VrRenderer.BrowserRow.ACTION),
-            Row("RENDER ${yprOf(renderer.effCopy())}", "snaps=${renderer.snapCount} — must follow GAMErv", VrRenderer.BrowserRow.ACTION),
+            Row("RENDER ${yprOf(renderer.effCopy())}", "snaps=${renderer.snapCount} kept=${renderer.keptFrames} — must follow GAMErv", VrRenderer.BrowserRow.ACTION),
             turnRow,
             Row("PEAK gyro ${String.format("%.2f", peakGyro[0])}/${String.format("%.2f", peakGyro[1])}/${String.format("%.2f", peakGyro[2])}",
                 "max rate per axis since page opened", VrRenderer.BrowserRow.ACTION),
@@ -1099,6 +1117,9 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             "panel" -> settings.panelDistM = ((1.2f + f * 3.8f) * 10f).roundToInt() / 10f
             "lensK1" -> settings.lensK1 = ((f * 100f).roundToInt() / 100f).coerceIn(0f, 1f)
             "lensK2" -> settings.lensK2 = ((f * 100f).roundToInt() / 100f).coerceIn(0f, 1f)
+            "lensK3" -> settings.lensK3 = ((f * 100f).roundToInt() / 100f).coerceIn(0f, 1f)
+            "lensCy" -> settings.lensCy = ((0.3f + f * 0.4f) * 100f).roundToInt() / 100f
+            "fishR" -> settings.fisheyeRadius = ((0.5f + f * 1f) * 100f).roundToInt() / 100f
             "lensStrength" -> settings.lensStrength = ((f * 3f * 20f).roundToInt() / 20f).coerceIn(0f, 3f)
 
             "dwell" -> settings.dwellMs = ((400f + f * 3600f) / 100f).roundToInt() * 100L
@@ -1217,6 +1238,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             }
             act == "set:swap" -> { settings.swapEyes = !settings.swapEyes; applyOptics(); refresh() }
             act == "set:pin" -> { settings.pinVideo = !settings.pinVideo; applyOptics(); refresh() }
+            act == "set:fishmirror" -> { settings.fisheyeMirrorR = !settings.fisheyeMirrorR; applyOptics(); refresh() }
             act.startsWith("adj:") -> {
                 val parts = act.split(":")
                 val key = parts[1]; val dir = if (parts[2] == "+") 1 else -1
@@ -1228,6 +1250,9 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                     "panel" -> settings.panelDistM = (settings.panelDistM + dir * 0.2f).coerceIn(1.2f, 5f)
                     "lensK1" -> settings.lensK1 = (settings.lensK1 + dir * 0.02f).coerceIn(0f, 1f)
                     "lensK2" -> settings.lensK2 = (settings.lensK2 + dir * 0.02f).coerceIn(0f, 1f)
+                    "lensK3" -> settings.lensK3 = (settings.lensK3 + dir * 0.02f).coerceIn(0f, 1f)
+                    "lensCy" -> settings.lensCy = (settings.lensCy + dir * 0.01f).coerceIn(0.3f, 0.7f)
+                    "fishR" -> settings.fisheyeRadius = (settings.fisheyeRadius + dir * 0.01f).coerceIn(0.5f, 1.5f)
                     "lensStrength" -> settings.lensStrength = (settings.lensStrength + dir * 0.1f).coerceIn(0f, 3f)
                     "dwell" -> settings.dwellMs = (settings.dwellMs + dir * 250).coerceIn(400L, 4000L)
                     else -> {

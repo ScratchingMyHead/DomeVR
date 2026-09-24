@@ -154,6 +154,25 @@ class SettingsStore(ctx: Context) {
     var lensStrength: Float
         get() = p.getFloat("lens_strength", 1f).coerceIn(0f, 3f)
         set(v) { p.edit().putFloat("lens_strength", v).apply() }
+    /** Aspheric-rim coefficient K3: f = 1 + S*(K1*r^2 + K2*r^4 + K3*r^6).
+     *  0 = off (recommended baseline with K1=K2=0 for dome validation). */
+    var lensK3: Float
+        get() = p.getFloat("lens_k3", 0f).coerceIn(0f, 1f)
+        set(v) { p.edit().putFloat("lens_k3", v).apply() }
+    /** Vertical optical-center position in lens-pass UV (0 bottom, 1 top).
+     *  0.5 = screen middle; tray misalignment moves it off-center. */
+    var lensCy: Float
+        get() = p.getFloat("lens_cy", 0.5f).coerceIn(0.3f, 0.7f)
+        set(v) { p.edit().putFloat("lens_cy", v).apply() }
+    /** Fisheye circle radius multiplier (1 = spec default: quarter frame
+     *  width). Calibration per camera rig. */
+    var fisheyeRadius: Float
+        get() = p.getFloat("fish_r", 1f).coerceIn(0.5f, 1.5f)
+        set(v) { p.edit().putFloat("fish_r", v).apply() }
+    /** Mirror the right eye's fisheye circle lookup (some rigs mirror it). */
+    var fisheyeMirrorR: Boolean
+        get() = p.getBoolean("fish_mirror_r", false)
+        set(v) { p.edit().putBoolean("fish_mirror_r", v).apply() }
     /** Look-up tilt (deg, 10..60) that opens the VR play menu when it is on top. */
     var menuAngleUp: Float
         get() = p.getFloat("menu_angle_up",

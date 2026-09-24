@@ -190,6 +190,12 @@ class VrRenderer(
     /** Successful basis snaps since creation (debug overlay). */
     @Volatile var snapCount = 0
         private set
+    /** Snap attempts that arrived with a degenerate screen frame (device
+     *  axis near world-up) while a basis already existed. Per §1 the old
+     *  frame is KEPT and rendering continues with it — never re-anchored
+     *  mid-session. In a healthy session this stays near zero. */
+    @Volatile var keptFrames = 0
+        private set
 
     /** Locked copy of the current effective view matrix (debug overlay). */
     fun effCopy(): FloatArray = synchronized(rawM) { effM.clone() }
@@ -203,8 +209,11 @@ class VrRenderer(
     }
 
     /** Snap "forward" to the current head pose. Call on tap and on entering VR.
-     *  Returns false when the phone is flat: the snap is deferred until the
-     *  next upright reading (setHeadMatrix retries automatically). */
+     *  Returns false only when there is no usable basis yet (phone flat at
+     *  session start): the snap is deferred until the next upright reading
+     *  (setHeadMatrix retries automatically). When a basis already exists
+     *  but the screen frame is momentarily degenerate, the existing frame
+     *  is KEPT (§1 — never re-anchor mid-gesture) and true is returned. */
     fun recenter(why: String = "auto"): Boolean {
         if (testSweep) return true // fixed canonical basis, nothing to snap
         var ok = false
@@ -220,11 +229,17 @@ class VrRenderer(
                 snapCount++
                 snapTag = "auto"
                 ok = true
+                inputGraceUntil = now() + 800
+            } else if (hasBasis) {
+                // Degenerate reading mid-session: keep rendering with the
+                // existing frame. Re-snapping here would re-anchor the world
+                // to the current head pose (perceived dragging/jumping).
+                keptFrames++
+                ok = true
             } else {
                 hasBasis = false // try again on the next reading
             }
         }
-        inputGraceUntil = now() + 800
         return ok
     }
 
@@ -274,7 +289,14 @@ class VrRenderer(
 
     private var progOes = 0; private var prog2d = 0
     private var aPosOes = 0; private var aTexOes = 0; private var uMvpOes = 0
-    private var uTexOes = 0; private var uStereoOes = 0; private var uEyeOes = 0; private var uZoomOes = 0
+    private var uTexOes = 0; private var uStereoOes = 0; private var uEyeOes = 0
+    private var uTexMatOes = 0; private var uZoomOutOes = 0
+    // Fisheye circle-sampling path (§8): same vertex shader, dedicated frag.
+    private var progFish = 0
+    private var aPosFish = 0; private var aTexFish = 0; private var uMvpFish = 0
+    private var uTexFish = 0; private var uStereoFish = 0; private var uEyeFish = 0
+    private var uTexMatFish = 0; private var uZoomOutFish = 0
+    private var uFishC = 0; private var uFishR = 0; private var uFishMirror = 0
     private var uWarpOnOes = 0; private var uWarpCxOes = 0; private var uWarpK1Oes = 0; private var uWarpK2Oes = 0; private var uWarpAspectOes = 0
     private var uWarpOn2d = 0; private var uWarpCx2d = 0; private var uWarpK12d = 0; private var uWarpK22d = 0; private var uWarpAspect2d = 0
     private var aPos2d = 0; private var aTex2d = 0; private var uMvp2d = 0; private var uTex2d = 0
@@ -290,9 +312,8 @@ class VrRenderer(
 
     private val projM = FloatArray(16)
     private val projEyeM = FloatArray(16)
-    // Video shares the plain projection now: zoom crops UVs in FRAG_OES,
-    // so the frustum (and all perspective/motion feel) never changes.
-    private val videoProjM = FloatArray(16)
+    // Video projection is the per-eye off-center physical frustum (§3),
+    // computed fresh every frame by videoFrustum() into projEyeVM.
     private val projEyeVM = FloatArray(16)
     private val viewM = FloatArray(16)
     /** Per-eye convergence shift, NDC units (half-screen spans 2.0).
@@ -420,7 +441,12 @@ class VrRenderer(
     /** Cardboard lens distortion coefficients (0..1, standard Cardboard). */
     @Volatile var lensK1 = 0.34f
     @Volatile var lensK2 = 0.55f
+    /** Aspheric-rim coefficient: scale = 1 + K1·r² + K2·r⁴ + K3·r⁶ (§6). */
+    @Volatile var lensK3 = 0f
     @Volatile var lensStrength = 1f
+    /** Vertical optical-center position in lens-pass UV (0 bottom, 1 top).
+     *  0.5 = screen middle; tray misalignment moves it off-center (§6). */
+    @Volatile var lensCy = 0.5f
     // Distortion runs as a FINAL pass on a flat quad (never on scene
     // geometry): warping scene vertices breaks GPU clipping where the
     // dome crosses behind the camera, fanning streaks across the screen.
@@ -441,6 +467,7 @@ class VrRenderer(
     private var uTexDist = 0
     private var uK1Dist = 0
     private var uK2Dist = 0
+    private var uK3Dist = 0
     private var uStrengthDist = 0
     private var uLensCDist = 0
     private var uTanDist = 0
@@ -458,6 +485,21 @@ class VrRenderer(
     private val mvpM = FloatArray(16)
     private val tmpM = FloatArray(16)
 
+    /** Decoded-frame aspect (width/height) for fisheye circle calibration.
+     *  Refreshed by the activity from the video track when known. */
+    @Volatile var videoAspect = 16f / 9f
+    /** Fisheye circle calibration (§8): radius multiplier (1 = default),
+     *  center offsets in frame UV, per-eye horizontal-mirror flags. */
+    @Volatile var fisheyeRadiusScale = 1f
+    @Volatile var fisheyeCxOff = 0f
+    @Volatile var fisheyeCyOff = 0f
+    @Volatile var fisheyeMirrorL = false
+    @Volatile var fisheyeMirrorR = false
+    /** Decoder texture transform (SurfaceTexture.getTransformMatrix),
+     *  refreshed every frame on the GL thread and honored by both video
+     *  sampling paths (§4). Identity until the first frame arrives. */
+    private val texMat = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
+
     @Volatile var lastWidth = 1
     @Volatile var lastHeight = 1
 
@@ -472,10 +514,11 @@ class VrRenderer(
         const val ROW_H = 64
 
         private const val VERT = """
-attribute vec4 aPos; attribute vec2 aTex; varying vec2 vTex; uniform mat4 uMvp;
+attribute vec4 aPos; attribute vec2 aTex; varying vec2 vTex; varying vec3 vDir; uniform mat4 uMvp;
 uniform float uWarpOn; uniform float uWarpCx; uniform float uWarpK1; uniform float uWarpK2; uniform float uWarpAspect;
 void main(){
   vTex = aTex;
+  vDir = aPos.xyz;
   vec4 p = uMvp * aPos;
   float w = p.w;
   if (uWarpOn > 0.5) {
@@ -496,6 +539,11 @@ void main(){
 """
         // highp UVs when available: mediump quantizes texture coordinates
         // to ~1024 steps, i.e. 8-texel blocks on 8K video ("lego").
+        // Equirectangular dome sampling (§2, §4): the mesh vertex UV already
+        // maps yaw/pitch linearly across the span; the stereo half is
+        // selected here and the decoder transform honored. Zoom-in narrows
+        // the projection frustum (§5); only zoom-out touches UVs, minifying
+        // about the half-image center so the frustum never widens.
         private const val FRAG_OES = """
 #extension GL_OES_EGL_image_external : require
 #ifdef GL_FRAGMENT_PRECISION_HIGH
@@ -504,23 +552,26 @@ precision highp float;
 precision mediump float;
 #endif
 varying vec2 vTex;
-uniform samplerExternalOES uTex; uniform int uStereo; uniform int uEye; uniform float uZoom;
+varying vec3 vDir;
+uniform samplerExternalOES uTex; uniform int uStereo; uniform int uEye;
+uniform mat4 uTexMat; uniform float uZoomOut;
 void main(){
   vec2 t = vTex;
   if (uStereo == 1) { t.x = (t.x + float(uEye)) * 0.5; }
   else if (uStereo == 2) { t.y = (t.y + float(uEye)) * 0.5; }
-  // zoom crops the picture, not the frustum: magnify content about the
-  // half-image center (each SBS/TB half is its own picture). Outside the
-  // frame paints black (shrunken screen on flat, void on domes). Unlike
-  // FOV zoom this never distorts perspective, at any value.
+  // Zoom-out minifies in texture space about the half-image center (§5).
+  // uZoomOut is 1 for zoom >= 1 (frustum narrowing owns that range); below
+  // 1 the sampled range EXPANDS (divide), so the picture shrinks toward
+  // the half center instead of widening the frustum into the rim zone.
+  // The half-bounds check below clamps the uncovered margin to black, so
+  // one eye never bleeds into the other's.
   vec2 c = vec2(0.5);
   if (uStereo == 1) { c = vec2(float(uEye) * 0.5 + 0.25, 0.5); }
   else if (uStereo == 2) { c = vec2(0.5, float(uEye) * 0.5 + 0.25); }
-  t = c + (t - c) / uZoom;
+  t = c + (t - c) / uZoomOut;
   // Bounds check per half-image (not full [0,1]): each eye only sees its
   // half. A full-range check lets zoom-out bleed the other eye's half in
-  // at the extremes (recovered from the binned dome-mesh branch, which
-  // had this right and master lost in a rewrite).
+  // at the extremes.
   bool oob = false;
   if (uStereo == 1) {
     float halfMin = float(uEye) * 0.5;
@@ -534,7 +585,64 @@ void main(){
     oob = (t.x < 0.0 || t.x > 1.0 || t.y < 0.0 || t.y > 1.0);
   }
   if (oob) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
-  gl_FragColor = texture2D(uTex, t);
+  vec4 st = uTexMat * vec4(t, 0.0, 1.0);
+  gl_FragColor = texture2D(uTex, st.xy);
+}
+"""
+        // Fisheye circle sampling (§8): each pixel's view direction is
+        // recovered from the interpolated mesh position (the dome is
+        // centered on the origin, so normalize(aPos) is the view ray).
+        // Angle from the forward axis (-Z) over a hemisphere gives the
+        // equidistant radius; the bearing gives the direction in the
+        // circle. Outside the active circle (corners included) is black.
+        // Mesh, basis, projection, zoom and lens pass are identical to the
+        // equirectangular path.
+        private const val FRAG_OES_FISH = """
+#extension GL_OES_EGL_image_external : require
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+varying vec2 vTex;
+varying vec3 vDir;
+uniform samplerExternalOES uTex; uniform int uStereo; uniform int uEye;
+uniform mat4 uTexMat; uniform float uZoomOut;
+uniform vec2 uFishC; uniform vec2 uFishR; uniform float uFishMirror;
+void main(){
+  vec3 d = normalize(vDir);
+  float cosA = clamp(-d.z, -1.0, 1.0);
+  float ang = acos(cosA);
+  float maxAng = 1.5707963;
+  if (ang > maxAng) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+  float s = sin(ang);
+  vec2 bearing = (s > 1e-4) ? (d.xy / s) : vec2(0.0, 0.0);
+  float rr = ang / maxAng;
+  vec2 off = bearing * rr;
+  if (uFishMirror > 0.5) { off.x = -off.x; }
+  if (dot(off, off) > 1.0) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+  vec2 t = uFishC + vec2(off.x * uFishR.x, off.y * uFishR.y);
+  // Zoom-out minifies in texture space about the half-image center (§5),
+  // same as the equirect path: the frustum never widens.
+  vec2 zc = vec2(0.5);
+  if (uStereo == 1) { zc = vec2(float(uEye) * 0.5 + 0.25, 0.5); }
+  else if (uStereo == 2) { zc = vec2(0.5, float(uEye) * 0.5 + 0.25); }
+  t = zc + (t - zc) / uZoomOut;
+  bool oob = false;
+  if (uStereo == 1) {
+    float halfMin = float(uEye) * 0.5;
+    float halfMax = halfMin + 0.5;
+    oob = (t.x < halfMin || t.x > halfMax || t.y < 0.0 || t.y > 1.0);
+  } else if (uStereo == 2) {
+    float halfMin = float(uEye) * 0.5;
+    float halfMax = halfMin + 0.5;
+    oob = (t.y < halfMin || t.y > halfMax || t.x < 0.0 || t.x > 1.0);
+  } else {
+    oob = (t.x < 0.0 || t.x > 1.0 || t.y < 0.0 || t.y > 1.0);
+  }
+  if (oob) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+  vec4 st = uTexMat * vec4(t, 0.0, 1.0);
+  gl_FragColor = texture2D(uTex, st.xy);
 }
 """
         private const val FRAG_2D = """
@@ -543,7 +651,7 @@ precision highp float;
 #else
 precision mediump float;
 #endif
-varying vec2 vTex; uniform sampler2D uTex;
+varying vec2 vTex; varying vec3 vDir; uniform sampler2D uTex;
 void main(){ gl_FragColor = texture2D(uTex, vTex); }
 """
         // Final-pass Cardboard lens pre-warp (per-pixel, flat quad at safe
@@ -554,7 +662,7 @@ void main(){ gl_FragColor = texture2D(uTex, vTex); }
         // Cardboard's distortInverse() is the same mapping walked the
         // other way (mesh verts live in texture space, texture->screen);
         // a screen-space fragment shader walks screen->texture, which is
-        // the plain forward r*(1+K1*r^2+K2*r^4) — no Newton solve needed.
+        // the plain forward r*(1+K1*r^2+K2*r^4+K3*r^6) — no Newton solve needed.
         // Sampling outside the eye image paints black, carving the curved
         // lens boundary. K1=K2=0 is exactly identity (proves the geometry).
         private const val FRAG_DIST = """
@@ -564,12 +672,13 @@ precision highp float;
 precision mediump float;
 #endif
 varying vec2 vTex;
-uniform sampler2D uTex; uniform float uK1; uniform float uK2;
+varying vec3 vDir;
+uniform sampler2D uTex; uniform float uK1; uniform float uK2; uniform float uK3;
 uniform float uStrength; uniform vec2 uLensC; uniform vec2 uTanPerUv;
 void main(){
   vec2 p = (vTex - uLensC) * uTanPerUv;
   float r2 = dot(p, p);
-  float f = 1.0 + uStrength * (uK1 * r2 + uK2 * r2 * r2);
+  float f = 1.0 + uStrength * (uK1 * r2 + uK2 * r2 * r2 + uK3 * r2 * r2 * r2);
   vec2 sc = uLensC + (p * f) / uTanPerUv;
   if (sc.x < 0.0 || sc.x > 1.0 || sc.y < 0.0 || sc.y > 1.0) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
   gl_FragColor = texture2D(uTex, sc);
@@ -593,7 +702,20 @@ void main(){
         uTexOes = GLES20.glGetUniformLocation(progOes, "uTex")
         uStereoOes = GLES20.glGetUniformLocation(progOes, "uStereo")
         uEyeOes = GLES20.glGetUniformLocation(progOes, "uEye")
-        uZoomOes = GLES20.glGetUniformLocation(progOes, "uZoom")
+        uTexMatOes = GLES20.glGetUniformLocation(progOes, "uTexMat")
+        uZoomOutOes = GLES20.glGetUniformLocation(progOes, "uZoomOut")
+        progFish = buildProgram(VERT, FRAG_OES_FISH)
+        aPosFish = GLES20.glGetAttribLocation(progFish, "aPos")
+        aTexFish = GLES20.glGetAttribLocation(progFish, "aTex")
+        uMvpFish = GLES20.glGetUniformLocation(progFish, "uMvp")
+        uTexFish = GLES20.glGetUniformLocation(progFish, "uTex")
+        uStereoFish = GLES20.glGetUniformLocation(progFish, "uStereo")
+        uEyeFish = GLES20.glGetUniformLocation(progFish, "uEye")
+        uTexMatFish = GLES20.glGetUniformLocation(progFish, "uTexMat")
+        uZoomOutFish = GLES20.glGetUniformLocation(progFish, "uZoomOut")
+        uFishC = GLES20.glGetUniformLocation(progFish, "uFishC")
+        uFishR = GLES20.glGetUniformLocation(progFish, "uFishR")
+        uFishMirror = GLES20.glGetUniformLocation(progFish, "uFishMirror")
         uWarpOnOes = GLES20.glGetUniformLocation(progOes, "uWarpOn")
         uWarpCxOes = GLES20.glGetUniformLocation(progOes, "uWarpCx")
         uWarpK1Oes = GLES20.glGetUniformLocation(progOes, "uWarpK1")
@@ -616,6 +738,7 @@ void main(){
         uTexDist = GLES20.glGetUniformLocation(progDist, "uTex")
         uK1Dist = GLES20.glGetUniformLocation(progDist, "uK1")
         uK2Dist = GLES20.glGetUniformLocation(progDist, "uK2")
+        uK3Dist = GLES20.glGetUniformLocation(progDist, "uK3")
         uStrengthDist = GLES20.glGetUniformLocation(progDist, "uStrength")
         uLensCDist = GLES20.glGetUniformLocation(progDist, "uLensC")
         uTanDist = GLES20.glGetUniformLocation(progDist, "uTanPerUv")
@@ -688,6 +811,9 @@ void main(){
                 try { st.updateTexImage(); if (frameAvailable) consumedFrames++ } catch (e: Throwable) { texFailCount++; if (texFailCount <= 3 || texFailCount % 300 == 0) { android.util.Log.e("DomeVR-GL", "updateTexImage failed #$texFailCount", e); FileLog.e("DomeVR-GL", "updateTexImage failed #$texFailCount", e) } }
                 frameAvailable = false
             }
+            // Decoder orientation (§4): honor the transform every frame so the
+            // sampled image matches what the decoder produced.
+            try { st.getTransformMatrix(texMat) } catch (_: Throwable) {}
         }
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         if (testSweep != lastTestSweep) {
@@ -718,8 +844,11 @@ void main(){
             Matrix.rotateM(rawM, 0, roll, 0f, 0f, 1f)
         }
         val w = lastWidth.coerceAtLeast(1); val h = lastHeight.coerceAtLeast(1)
+        // Browser/menu panels: symmetric perspective + NDC convergence shift
+        // (rotation-only UI, identical geometry in both eyes).
         Matrix.perspectiveM(projM, 0, fovDeg.coerceIn(40f, 110f), (w / 2f) / h, 0.1f, 100f)
-        Matrix.perspectiveM(videoProjM, 0, fovDeg.coerceIn(40f, 110f), (w / 2f) / h, 0.1f, 100f)
+        // Video uses the off-center physical frustum (§3), computed per eye
+        // inside the loop below — never the symmetric matrix.
         val cur: Mode = mode
         val wantMeshKey = projection.name + "|sh=" + shapingRevision.toString()
         if (meshKey != wantMeshKey) {
@@ -746,9 +875,9 @@ void main(){
             System.arraycopy(projM, 0, projEyeM, 0, 16)
             projEyeM[8] = if (eye == 0) -convShiftNdc else convShiftNdc
             Matrix.multiplyMM(flatM, 0, projEyeM, 0, effM, 0)
-            // video uses the zoomed projection (same convergence shift)
-            System.arraycopy(videoProjM, 0, projEyeVM, 0, 16)
-            projEyeVM[8] = projEyeM[8]
+            // Video: off-center physical frustum for this eye (§3, §5).
+            // No NDC convergence hack here — the asymmetry is the frustum.
+            videoFrustum(eye, w, h, projEyeVM)
             if (cur == Mode.VIDEO && pinVideo) {
                 // pinned: screen fixed dead-ahead, only eye shift
                 Matrix.setIdentityM(viewM, 0)
@@ -850,19 +979,21 @@ void main(){
         val tu = clipV[0] / cw * 0.5f + 0.5f
         val tv = clipV[1] / cw * 0.5f + 0.5f
         val cx = if (vp == 0) lensCxL else lensCxR
+        val tcy = lensCy.coerceIn(0f, 1f)
         val tx = (tu - cx) * tanPerU
-        val ty = (tv - 0.5f) * tanPerV
+        val ty = (tv - tcy) * tanPerV
         val rt = kotlin.math.sqrt(tx * tx + ty * ty)
         var rs = rt
         val st = lensStrength
         for (i in 0 until 4) {
-            val f = rs * (1f + st * (lensK1 * rs * rs + lensK2 * rs * rs * rs * rs)) - rt
-            val fp = 1f + st * (3f * lensK1 * rs * rs + 5f * lensK2 * rs * rs * rs * rs)
+            val rs2 = rs * rs
+            val f = rs * (1f + st * (lensK1 * rs2 + lensK2 * rs2 * rs2 + lensK3 * rs2 * rs2 * rs2)) - rt
+            val fp = 1f + st * (3f * lensK1 * rs2 + 5f * lensK2 * rs2 * rs2 + 7f * lensK3 * rs2 * rs2 * rs2)
             rs -= f / fp
         }
         val k = if (rt > 1e-6f) rs / rt else 1f
         val su = cx + tx * k / tanPerU
-        val sv = 0.5f + ty * k / tanPerV
+        val sv = tcy + ty * k / tanPerV
         // the distortion quad is fullscreen (-1..1) under a HALF viewport,
         // so its center is NDC (0,0) per eye
         var nx = su * 2f - 1f
@@ -933,8 +1064,9 @@ void main(){
         GLES20.glUniform1i(uTexDist, 0)
         GLES20.glUniform1f(uK1Dist, lensK1)
         GLES20.glUniform1f(uK2Dist, lensK2)
+        GLES20.glUniform1f(uK3Dist, lensK3)
         GLES20.glUniform1f(uStrengthDist, lensStrength)
-        GLES20.glUniform2f(uLensCDist, if (vp == 0) lensCxL else lensCxR, 0.5f)
+        GLES20.glUniform2f(uLensCDist, if (vp == 0) lensCxL else lensCxR, lensCy.coerceIn(0f, 1f))
         GLES20.glUniform2f(uTanDist, tanPerU, tanPerV)
         GLES20.glUniformMatrix4fv(uMvpDist, 1, false, identM, 0)
         val v = floatArrayOf(-1f, -1f, 0f, -1f, 1f, 0f, 1f, -1f, 0f, 1f, 1f, 0f)
@@ -946,6 +1078,57 @@ void main(){
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
         GLES20.glDisableVertexAttribArray(aPosDist)
         GLES20.glDisableVertexAttribArray(aTexDist)
+    }
+
+    /** Split zoom range (§5): frustum scale owns zoom >= 1, texture
+     *  minification owns zoom < 1. Shared by both video sampling paths. */
+    private fun zoomOutF(): Float = zoom.coerceIn(0.3f, 2.5f).coerceAtMost(1f)
+    private fun zoomInF(): Float = zoom.coerceIn(0.3f, 2.5f).coerceAtLeast(1f)
+
+    /** Per-eye off-center perspective from the viewer profile (§3).
+     *
+     *  Each eye is a parallel camera: the shared head orientation plus a
+     *  lateral translation of half the inter-ocular distance (applied by
+     *  the caller). The frustum is asymmetric: each half-screen's physical
+     *  extent (from display density) is measured relative to that eye's
+     *  position at lens-to-screen depth, so the two halves meet at the
+     *  configured eye separation and the image centers land on the lenses.
+     *  Near/far are 0.1/100 m — ample for a dome at tens of meters.
+     *
+     *  Zoom-in (§5) scales the frustum symmetrically about its own center;
+     *  zoom-out never reaches this function (zoomInF() clamps at 1), so the
+     *  frustum only ever stays the same or gets narrower, never wider.
+     */
+    /** Viewer profile screen-to-lens depth (mm). The eye frustum halves
+     *  are measured at this depth (GVR lens_distortion convention), NOT at
+     *  the eye-to-screen depth used for distortion r units. */
+    private val SCREEN_TO_LENS_MM = 39f
+    private fun videoFrustum(eye: Int, w: Int, h: Int, out: FloatArray) {
+        val near = 0.1f; val far = 100f
+        val mmPx = mmPerPx.coerceAtLeast(1e-3f)
+        val depthMm = SCREEN_TO_LENS_MM
+        val fullWmm = w.toFloat() * mmPx
+        val fullHmm = h.toFloat() * mmPx
+        val eyeXmm = (if (eye == 0) -eyeHalfM else eyeHalfM) * 1000f
+        val eyeYmm = (lensCy.coerceIn(0f, 1f) - 0.5f) * fullHmm
+        // This eye's half-screen extent, in mm right/up of phone center.
+        val sL = if (eye == 0) -fullWmm / 2f else 0f
+        val sR = if (eye == 0) 0f else fullWmm / 2f
+        val sB = -fullHmm / 2f
+        val sT = fullHmm / 2f
+        var l = (sL - eyeXmm) * near / depthMm
+        var r = (sR - eyeXmm) * near / depthMm
+        var b = (sB - eyeYmm) * near / depthMm
+        var t = (sT - eyeYmm) * near / depthMm
+        // Profile-native frustum (matches the reference viewer: no fovDeg
+        // remap, so zoom 1 shows the same window). Zoom-in only narrows
+        // symmetrically about the frustum center; zoom < 1 is owned by
+        // texture-space minification and never widens this.
+        val s = (1f / zoomInF()).coerceIn(0.15f, 5f)
+        val cx = (l + r) / 2f; val cy = (b + t) / 2f
+        val hw = (r - l) / 2f * s; val hh = (t - b) / 2f * s
+        l = cx - hw; r = cx + hw; b = cy - hh; t = cy + hh
+        Matrix.frustumM(out, 0, l, r, b, t, near, far)
     }
 
     /** (Re)creates the eye FBO at half-screen size. Failure falls back to
@@ -1587,13 +1770,18 @@ void main(){
     // ---------- drawing ----------
     private fun drawVideo(eye: Int, warpCx: Float, aspect: Float) {
         val m = mesh ?: return
+        if (projection == Projection.FISHEYE) {
+            drawVideoFisheye(eye, m)
+            return
+        }
         GLES20.glUseProgram(progOes)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, videoTextureId)
         GLES20.glUniform1i(uTexOes, 0)
         GLES20.glUniform1i(uStereoOes, when (stereo) { Stereo.MONO -> 0; Stereo.SBS -> 1; Stereo.TB -> 2 })
         GLES20.glUniform1i(uEyeOes, eye)
-        GLES20.glUniform1f(uZoomOes, zoom.coerceIn(0.3f, 2.5f))
+        GLES20.glUniformMatrix4fv(uTexMatOes, 1, false, texMat, 0)
+        GLES20.glUniform1f(uZoomOutOes, zoomOutF())
         GLES20.glUniformMatrix4fv(uMvpOes, 1, false, mvpM, 0)
         setWarp(uWarpOnOes, uWarpCxOes, uWarpK1Oes, uWarpK2Oes, uWarpAspectOes, warpCx, aspect)
         GLES20.glEnableVertexAttribArray(aPosOes)
@@ -1605,12 +1793,63 @@ void main(){
         GLES20.glDisableVertexAttribArray(aTexOes)
     }
 
+    /** Fisheye video path (§8): same mesh/basis/projection/zoom as the
+     *  equirect path — only the texture lookup differs (equidistant circle
+     *  inversion from the per-fragment view direction). */
+    private fun drawVideoFisheye(eye: Int, m: Mesh) {
+        GLES20.glUseProgram(progFish)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, videoTextureId)
+        GLES20.glUniform1i(uTexFish, 0)
+        val st = when (stereo) { Stereo.MONO -> 0; Stereo.SBS -> 1; Stereo.TB -> 2 }
+        GLES20.glUniform1i(uStereoFish, st)
+        GLES20.glUniform1i(uEyeFish, eye)
+        GLES20.glUniformMatrix4fv(uTexMatFish, 1, false, texMat, 0)
+        GLES20.glUniform1f(uZoomOutFish, zoomOutF())
+        GLES20.glUniformMatrix4fv(uMvpFish, 1, false, mvpM, 0)
+        // Active circle: per-layout defaults (§8: half-image center, radius
+        // of one quarter frame width) plus calibration offsets.
+        val ar = videoAspect.coerceIn(0.5f, 4f)
+        val rs = fisheyeRadiusScale.coerceIn(0.25f, 2f)
+        val cx: Float; val cy: Float; val ru: Float; val rv: Float
+        when (st) {
+            1 -> { // side-by-side: left circle in left half, right in right
+                cx = eye * 0.5f + 0.25f + fisheyeCxOff
+                cy = 0.5f + fisheyeCyOff
+                ru = 0.25f * rs; rv = 0.25f * ar * rs
+            }
+            2 -> { // stacked halves
+                cx = 0.5f + fisheyeCxOff
+                cy = eye * 0.5f + 0.25f + fisheyeCyOff
+                ru = 0.25f * rs; rv = 0.5f * ar * rs
+            }
+            else -> { // single circle over the full frame
+                cx = 0.5f + fisheyeCxOff
+                cy = 0.5f + fisheyeCyOff
+                ru = 0.5f * rs; rv = 0.5f * ar * rs
+            }
+        }
+        GLES20.glUniform2f(uFishC, cx, cy)
+        GLES20.glUniform2f(uFishR, ru, rv)
+        GLES20.glUniform1f(uFishMirror, if ((eye == 0 && fisheyeMirrorL) || (eye == 1 && fisheyeMirrorR)) 1f else 0f)
+        GLES20.glEnableVertexAttribArray(aPosFish)
+        GLES20.glVertexAttribPointer(aPosFish, 3, GLES20.GL_FLOAT, false, 0, m.verts)
+        GLES20.glEnableVertexAttribArray(aTexFish)
+        GLES20.glVertexAttribPointer(aTexFish, 2, GLES20.GL_FLOAT, false, 0, m.tex)
+        GLES20.glDrawElements(GLES20.GL_TRIANGLES, m.indexCount, GLES20.GL_UNSIGNED_SHORT, m.indices)
+        GLES20.glDisableVertexAttribArray(aPosFish)
+        GLES20.glDisableVertexAttribArray(aTexFish)
+    }
+
     /** Bilinear grid over the quad (p00 top-left, p10 top-right, p01
      *  bottom-left, p11 bottom-right). Per-vertex lens warp needs real
-     *  vertices across the surface — a 2-triangle quad warps wrong. */
+     *  vertices across the surface — a 2-triangle quad warps wrong.
+     *  flipV = true for decoder-fed video quads: V is emitted in
+     *  displayed-image space (v up) with the decoder flip left to uTexMat;
+     *  canvas panels (plain sampler2D, no transform) use flipV = false. */
     private fun gridQuadP(
         p00: FloatArray, p10: FloatArray, p01: FloatArray, p11: FloatArray,
-        nx: Int, ny: Int
+        nx: Int, ny: Int, flipV: Boolean = false
     ): Mesh {
         val verts = FloatArray((nx + 1) * (ny + 1) * 3)
         val texs = FloatArray((nx + 1) * (ny + 1) * 2)
@@ -1624,7 +1863,7 @@ void main(){
                     val bot = p01[k] + (p11[k] - p01[k]) * u
                     verts[vi++] = top + (bot - top) * v
                 }
-                texs[ti++] = u; texs[ti++] = v
+                texs[ti++] = u; texs[ti++] = if (flipV) 1f - v else v
             }
         }
         val idx = mutableListOf<Short>()
@@ -2151,9 +2390,12 @@ void main(){
             Projection.FLAT -> gridQuadP(
                 floatArrayOf(-3.2f, 1.8f, -4f), floatArrayOf(3.2f, 1.8f, -4f),
                 floatArrayOf(-3.2f, -1.8f, -4f), floatArrayOf(3.2f, -1.8f, -4f),
-                24, 12
+                24, 12, flipV = true
             )
-            Projection.FISHEYE -> sphereSegment(180f, flipX = true)
+            // Fisheye uses the same 180° sphere mesh as the domes (§8: mesh,
+            // basis, projection and zoom identical — only sampling differs).
+            // Mirrored rigs are handled in the circle lookup, not the mesh.
+            Projection.FISHEYE -> sphereSegment(180f)
             Projection.DEG180 -> sphereSegment(180f)
             Projection.DEG220 -> sphereSegment(220f)
             Projection.DEG270 -> sphereSegment(270f)
@@ -2211,9 +2453,18 @@ void main(){
         return Mesh(m.verts, fb(out), m.indices, m.indexCount)
     }
 
-    private fun sphereSegment(deg: Float, flipX: Boolean = false): Mesh {
+    /** Sphere segment mesh (§2, §9): ~24 rows × 48 columns, large-radius
+     *  sphere (tens of meters, so the inter-ocular offset is a negligible
+     *  fraction of the radius and stereo parallax artifacts are absent by
+     *  construction). U maps yaw linearly across the span, V maps pitch
+     *  linearly; the frame's full width maps across the span's yaw range,
+     *  so intermediate spans are centered sub-windows clamping at the
+     *  content edge. The yaw seam (ix 0 vs ix cols) uses duplicated
+     *  vertices carrying U 0 and 1, so filtering never blends across the
+     *  cut; V clamps at the poles via CLAMP_TO_EDGE. */
+    private fun sphereSegment(deg: Float): Mesh {
         val rows = 24; val cols = 48
-        val r = 8f
+        val r = 50f
         val yawMax = Math.toRadians((deg / 2).toDouble())
         val verts = mutableListOf<Float>(); val texs = mutableListOf<Float>()
         for (iy in 0..rows) {
@@ -2228,7 +2479,11 @@ void main(){
                 val y = (r * Math.sin(pitch)).toFloat()
                 val z = (-r * Math.cos(pitch) * Math.cos(yaw)).toFloat()
                 verts += listOf(x, y, z)
-                texs += listOf(if (flipX) 1f - u else u, 1f - v)
+                // V in displayed-image space (v up): dome bottom samples the
+                // frame bottom. The decoder's own flip/rotation lives in
+                // uTexMat (§4) — baking a flip here too would mirror the
+                // picture top-to-bottom.
+                texs += listOf(u, v)
             }
         }
         val idx = mutableListOf<Short>()
