@@ -134,11 +134,25 @@ class VrRenderer(
 
     // highlight index into FULL rows list
     private var highlight = -1
-    private var scroll = 0
+    /** Top edge of the rows window, in row units. File pages glide it
+     *  fractionally while a scroll strip is engaged; settings pages snap
+     *  it to integers via ensureVisible. Counts from the first SCROLLING
+     *  row (after the pinned top rows). */
+    private var scrollPos = 0f
+    /** Pinned top rows: file pages pin home + up = 2 (scroll strips on),
+     *  settings/shaping/sensor pages 0 (plain window, no strips). Set by
+     *  the activity per page in pushRows. */
+    @Volatile var pinTopRows = 0
+    /** Scroll-strip state (GL thread): 0 idle, -1 scrolling up, +1 down. */
+    private var scrollEngage = 0
+    /** Strip currently earning trigger progress (same sign convention). */
+    private var scrollTrigDir = 0
+    /** Trigger progress 0..1: short still-gaze on a strip engages it. */
+    private var scrollTrigF = 0f
     private var dwellStart = 0L
     private var dwellFiredFor = -2
     // X close button (title bar, top right): own dwell state, fires sentinel -10.
-    // Hit zone in panel TEX coords: x > 920, y < ROWS_Y0 (above the rows).
+    // Hit zone in panel TEX coords: x > 920, y < TITLE_Y1 (title bar).
     private var inXZone = false
     private var xProgF = 0f
     private var xDwellFired = false
@@ -300,6 +314,7 @@ class VrRenderer(
     private var uWarpOnOes = 0; private var uWarpCxOes = 0; private var uWarpK1Oes = 0; private var uWarpK2Oes = 0; private var uWarpAspectOes = 0
     private var uWarpOn2d = 0; private var uWarpCx2d = 0; private var uWarpK12d = 0; private var uWarpK22d = 0; private var uWarpAspect2d = 0
     private var aPos2d = 0; private var aTex2d = 0; private var uMvp2d = 0; private var uTex2d = 0
+    private var uAlpha2d = 0
 
     private var mesh: Mesh? = null
     private var meshKey: String = ""
@@ -397,6 +412,7 @@ class VrRenderer(
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, toastTexId)
         GLES20.glUniform1i(uTex2d, 0)
+        GLES20.glUniform1f(uAlpha2d, 1f)
         GLES20.glUniformMatrix4fv(uMvp2d, 1, false, identM, 0)
         GLES20.glUniform1f(uWarpOn2d, 0f)
         GLES20.glEnableVertexAttribArray(aPos2d)
@@ -432,9 +448,10 @@ class VrRenderer(
     private var menuDwellPrevInit = false
     private val menuDwellPrevM = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
     private var menuDwellPrevT = 0L
-    /** When the gaze first dropped below the open angle (0 = above it).
-     *  Closing needs 400ms continuously below: sensor noise at the exact
-     *  threshold must not strobe the menu (and reset every dwell). */
+    /** When the gaze first dropped below the close threshold (0 = above).
+     *  Closing needs 400ms continuously below: sensor noise and transient
+     *  tilt dips while operating the end buttons must not strobe the menu
+     *  (and reset every dwell). */
     private var menuBelowSince = 0L
     private var menuWasOpen = false
     private var menuProgFresh = true
@@ -504,14 +521,37 @@ class VrRenderer(
     @Volatile var lastHeight = 1
 
     companion object {
-        const val VISIBLE_ROWS = 13
         const val MENU_BUTTONS = 14
         // Cardboard v1 eye-to-screen distance (mm). r_tanAngle = offset_m /
         // eyeToScreen is the unit system the distortion coefficients live in.
         private const val EYE_TO_SCREEN_MM = 84.3f
         const val TEX = 1024
-        const val ROWS_Y0 = 150
         const val ROW_H = 64
+        // ---- browser panel layout (TEX coords, y down) ----
+        // Settings pages: title bar, then a plain 13-row window.
+        // File pages (pin 2): title bar, pinned home + up rows, scroll-up
+        // strip, scrolling window, scroll-down strip. The strips are pinned
+        // chrome: always visible whenever the list overflows the window.
+        // The window holds 12 rows total shared between pinned and
+        // scrolling rows, so the down strip always lands at the same y.
+        const val TITLE_Y1 = 110
+        const val ROWS_Y0 = 150
+        const val VISIBLE_ROWS = 13
+        const val PIN_Y0 = 114
+        const val STRIP_H = 56
+        /** Rows visible in the scrolling window (12 minus pinned rows). */
+        fun winRows(pin: Int): Int = 12 - pin.coerceIn(0, 2)
+        /** Top y of the scroll-up strip. */
+        fun upStripY0(pin: Int): Float = (PIN_Y0 + pin.coerceIn(0, 2) * ROW_H).toFloat()
+        /** Top y of the scrolling rows window. */
+        fun rowsY0(pin: Int): Float = upStripY0(pin) + STRIP_H
+        /** Top y of the scroll-down strip (same for pin 0..2 by design). */
+        fun downStripY0(pin: Int): Float = rowsY0(pin) + winRows(pin) * ROW_H
+        // Scroll-strip feel: still-gaze time to engage, then rows/second.
+        const val STRIP_TRIG_MS = 350f
+        const val STRIP_ROWS_PER_SEC = 10f
+        // Panel open/close fade: fast smoothstep, both directions.
+        const val PANEL_FADE_MS = 180f
 
         private const val VERT = """
 attribute vec4 aPos; attribute vec2 aTex; varying vec2 vTex; varying vec3 vDir; uniform mat4 uMvp;
@@ -651,8 +691,8 @@ precision highp float;
 #else
 precision mediump float;
 #endif
-varying vec2 vTex; varying vec3 vDir; uniform sampler2D uTex;
-void main(){ gl_FragColor = texture2D(uTex, vTex); }
+varying vec2 vTex; varying vec3 vDir; uniform sampler2D uTex; uniform float uAlpha;
+void main(){ gl_FragColor = texture2D(uTex, vTex) * vec4(1.0, 1.0, 1.0, uAlpha); }
 """
         // Final-pass Cardboard lens pre-warp (per-pixel, flat quad at safe
         // depth): Brown-Conrady radial, r in TAN-ANGLE units from this
@@ -726,6 +766,7 @@ void main(){
         aTex2d = GLES20.glGetAttribLocation(prog2d, "aTex")
         uMvp2d = GLES20.glGetUniformLocation(prog2d, "uMvp")
         uTex2d = GLES20.glGetUniformLocation(prog2d, "uTex")
+        uAlpha2d = GLES20.glGetUniformLocation(prog2d, "uAlpha")
         uWarpOn2d = GLES20.glGetUniformLocation(prog2d, "uWarpOn")
         uWarpCx2d = GLES20.glGetUniformLocation(prog2d, "uWarpCx")
         uWarpK12d = GLES20.glGetUniformLocation(prog2d, "uWarpK1")
@@ -860,6 +901,11 @@ void main(){
         lastEffUp = floatArrayOf(effM[1], effM[5], effM[9])
         if (cur == Mode.BROWSER) updateGaze()
         if (cur == Mode.VIDEO) updateMenu() else menuOpen = false
+        // Panel fade (fast smoothstep both ways): browser fades with mode,
+        // menu with menuOpen. Alphas gate the draw calls below so a closing
+        // panel keeps rendering until fully transparent.
+        val browA = fadeAlpha(cur == Mode.BROWSER, true)
+        val menuA = fadeAlpha(cur == Mode.VIDEO && menuOpen, false)
         val swap = swapEyes
         // Rotation-only UI: identical geometry in both eyes (no vergence
         // conflict); per-eye convergence below centers the images.
@@ -907,9 +953,9 @@ void main(){
                 GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
                 // Panels float over live video: in BROWSER mode the video
                 // keeps rendering behind the panel (when frames have arrived).
-                if (cur == Mode.VIDEO) drawVideo(eye, warpCx, eyeAspect)
-                else { if (arrivedFrames > 0) drawVideo(eye, warpCx, eyeAspect); drawBrowser(warpCx, eyeAspect) }
-                if (cur == Mode.VIDEO && menuOpen) drawMenuPanel(warpCx, eyeAspect)
+                if (cur == Mode.VIDEO) { drawVideo(eye, warpCx, eyeAspect); if (browA > 0f) drawBrowser(warpCx, eyeAspect, browA) }
+                else { if (arrivedFrames > 0) drawVideo(eye, warpCx, eyeAspect); if (browA > 0f) drawBrowser(warpCx, eyeAspect, browA) }
+                if (menuA > 0f) drawMenuPanel(warpCx, eyeAspect, menuA)
                 // mipmaps for the distortion minification (smooth, not chunky)
                 GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, fboTexId)
                 GLES20.glGenerateMipmap(GLES20.GL_TEXTURE_2D)
@@ -918,9 +964,9 @@ void main(){
                 drawDistortionQuad(vp)
             } else {
                 GLES20.glViewport(vp * w / 2, 0, w / 2, h)
-                if (cur == Mode.VIDEO) drawVideo(eye, warpCx, eyeAspect)
-                else { if (arrivedFrames > 0) drawVideo(eye, warpCx, eyeAspect); drawBrowser(warpCx, eyeAspect) }
-                if (cur == Mode.VIDEO && menuOpen) drawMenuPanel(warpCx, eyeAspect)
+                if (cur == Mode.VIDEO) { drawVideo(eye, warpCx, eyeAspect); if (browA > 0f) drawBrowser(warpCx, eyeAspect, browA) }
+                else { if (arrivedFrames > 0) drawVideo(eye, warpCx, eyeAspect); if (browA > 0f) drawBrowser(warpCx, eyeAspect, browA) }
+                if (menuA > 0f) drawMenuPanel(warpCx, eyeAspect, menuA)
             }
             // Menu lives in the browser's pipeline (FBO + flatM with
             // convergence), so it fuses exactly like the browser panel.
@@ -933,10 +979,20 @@ void main(){
                 drawScreenPointer(aimW[0], aimW[1], aimW[2], flatM, eyeAspect,
                     aimProg.coerceIn(0f, 1f), 2f, aimTexId, vp)
             // screen-space pointer, re-warped to the displayed position:
-            // project the world hit with this eye's rotation-only matrix
+            // project the world hit with this eye's rotation-only matrix.
+            // The reticle never vanishes while the panel is up: off-panel
+            // gaze parks it on the head-forward ray at panel depth,
+            // projected per eye exactly like a panel hit — identical NDC
+            // in both halves would sit half a screen apart and refuse to
+            // fuse, which is why this goes through drawScreenPointer.
             if (cur == Mode.BROWSER && hitValid)
                 drawScreenPointer(hitX, hitY, hitZ, flatM, eyeAspect,
                     if (inXZone) xProgF.coerceIn(0f, 1f) else browserDwellProg(), vp = vp)
+            else if (cur == Mode.BROWSER) {
+                val fwd = lastEffFwd
+                drawScreenPointer(fwd[0] * panelDistM, fwd[1] * panelDistM, fwd[2] * panelDistM,
+                    flatM, eyeAspect, 0f, vp = vp)
+            }
             drawToast()
         }
     }
@@ -999,6 +1055,15 @@ void main(){
         var nx = su * 2f - 1f
         var ny = sv * 2f - 1f
         if (nx < -1.2f || nx > 1.2f || ny < -1.2f || ny > 1.2f) return
+        drawPointerQuad(nx, ny, aspect, prog, sizeMul, texId)
+    }
+
+    /** Screen-space reticle quad at NDC (nx, ny): full ring at prog 0,
+     *  shrinking toward a point as dwell progresses. */
+    private fun drawPointerQuad(
+        nx: Float, ny: Float, aspect: Float, prog: Float,
+        sizeMul: Float = 1f, texId: Int = -1
+    ) {
         val sx = 0.022f * sizeMul * (1f - 0.85f * prog)
         val sy = sx * aspect
         putQuad(ptrVerts, ptrTex, nx - sx, ny - sy, nx + sx, ny + sy)
@@ -1006,6 +1071,7 @@ void main(){
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, if (texId < 0) reticleTexId else texId)
         GLES20.glUniform1i(uTex2d, 0)
+        GLES20.glUniform1f(uAlpha2d, 1f)
         GLES20.glUniformMatrix4fv(uMvp2d, 1, false, identM, 0)
         // screen-space pointer: warp stays off (ring must stay round)
         GLES20.glUniform1f(uWarpOn2d, 0f)
@@ -1120,11 +1186,19 @@ void main(){
         var r = (sR - eyeXmm) * near / depthMm
         var b = (sB - eyeYmm) * near / depthMm
         var t = (sT - eyeYmm) * near / depthMm
-        // Profile-native frustum (matches the reference viewer: no fovDeg
-        // remap, so zoom 1 shows the same window). Zoom-in only narrows
-        // symmetrically about the frustum center; zoom < 1 is owned by
-        // texture-space minification and never widens this.
-        val s = (1f / zoomInF()).coerceIn(0.15f, 5f)
+        // User-FOV fit composed with zoom-in: the physical frustum is
+        // scaled symmetrically about its own center so the vertical field
+        // matches fovDeg (the same setting that drives the menu panels),
+        // preserving the off-center asymmetry. Zoom-in only narrows
+        // further; zoom < 1 is owned by texture-space minification and
+        // never widens this.
+        val physTanV = (fullHmm / 2f) / depthMm
+        val s = if (physTanV > 1e-4f) {
+            val wantTanV = kotlin.math.tan(Math.toRadians((fovDeg.coerceIn(40f, 110f) / 2f).toDouble())).toFloat()
+            (wantTanV / physTanV / zoomInF()).coerceIn(0.15f, 5f)
+        } else {
+            (1f / zoomInF()).coerceIn(0.15f, 5f)
+        }
         val cx = (l + r) / 2f; val cy = (b + t) / 2f
         val hw = (r - l) / 2f * s; val hh = (t - b) / 2f * s
         l = cx - hw; r = cx + hw; b = cy - hh; t = cy + hh
@@ -1245,8 +1319,8 @@ void main(){
                 hitX = hx; hitY = hy; hitZ = hz; hitValid = true
                 val u = (alongRight + hw) / (2 * hw)
                 val v = (hh - alongUp) / (2 * hh)
-                // X close button: top-right title bar, above the rows.
-                if (u > 0.90f && v * TEX < ROWS_Y0) {
+                // X close button: top-right title bar.
+                if (u > 0.90f && v * TEX < TITLE_Y1) {
                     inXZone = true
                     sliderHoverU = -1f
                     lastFiredU = Float.NaN
@@ -1269,9 +1343,40 @@ void main(){
                 inXZone = false
                 xDwellFired = false
                 xProgF = maxOf(0f, xProgF - dtMs / 600f)
-                val vi = ((v * TEX - ROWS_Y0) / ROW_H).toInt()
-                if (vi in 0 until VISIBLE_ROWS) {
-                    val idx = (scroll + vi).coerceIn(0, rows.size - 1)
+                val pin = pinTopRows.coerceIn(0, 2)
+                var idx = -1
+                if (pin > 0) {
+                    // File pages: strips + pinned rows + fractional window.
+                    val win = winRows(pin)
+                    val ypx = v * TEX
+                    val upY0 = upStripY0(pin); val rY0 = rowsY0(pin); val dnY0 = downStripY0(pin)
+                    val scrollable = rows.size > pin + win
+                    val inBarX = u * TEX >= 20f && u * TEX <= 1004f
+                    if (scrollable && inBarX && ypx >= upY0 && ypx < upY0 + STRIP_H) {
+                        stripGaze(-1, dtMs, still, hx, hy, hz)
+                        return
+                    }
+                    if (scrollable && inBarX && ypx >= dnY0 && ypx < dnY0 + STRIP_H) {
+                        stripGaze(1, dtMs, still, hx, hy, hz)
+                        return
+                    }
+                    if (scrollEngage != 0 || scrollTrigDir != 0) {
+                        scrollEngage = 0; scrollTrigDir = 0; scrollTrigF = 0f
+                    }
+                    if (ypx >= PIN_Y0 && ypx < PIN_Y0 + pin * ROW_H) {
+                        idx = ((ypx - PIN_Y0) / ROW_H).toInt().coerceIn(0, pin - 1)
+                    } else if (ypx >= rY0 && ypx < rY0 + win * ROW_H && rows.size > pin) {
+                        val f = pin + scrollPos + (ypx - rY0) / ROW_H
+                        idx = f.toInt().coerceIn(pin, rows.size - 1)
+                    }
+                } else {
+                    // Settings pages: plain fixed window, no strips.
+                    val vi = ((v * TEX - ROWS_Y0) / ROW_H).toInt()
+                    if (vi in 0 until VISIBLE_ROWS) {
+                        idx = (scrollPos.toInt() + vi).coerceIn(0, rows.size - 1)
+                    }
+                }
+                if (idx in rows.indices) {
                     // dead rows are gaze rest zones: drain, never accumulate or fire
                     if (rows[idx].dead) {
                         if (idx != highlight) { highlight = idx; dwellFiredFor = -2 }
@@ -1344,10 +1449,62 @@ void main(){
         browProgF = maxOf(0f, browProgF - 16f / 600f)
     }
 
+    /** Gaze on a scroll strip (file pages only): a short still-gaze
+     *  engages it, then the rows window glides continuously while the gaze
+     *  stays on the strip. Looking away stops immediately. */
+    private fun stripGaze(dir: Int, dtMs: Long, still: Boolean, hx: Float, hy: Float, hz: Float) {
+        hitX = hx; hitY = hy; hitZ = hz; hitValid = true
+        highlight = -1; dwellFiredFor = -2
+        sliderHoverU = -1f; lastFiredU = Float.NaN; fireBlockedLogged = false
+        inXZone = false; xDwellFired = false
+        browProgF = maxOf(0f, browProgF - dtMs / 600f)
+        xProgF = maxOf(0f, xProgF - dtMs / 600f)
+        if (scrollEngage == dir) {
+            val pin = pinTopRows.coerceIn(0, 2)
+            val maxS = maxOf(0, browserRows.size - pin - winRows(pin)).toFloat()
+            scrollPos = (scrollPos + dir * STRIP_ROWS_PER_SEC * dtMs / 1000f).coerceIn(0f, maxS)
+            return
+        }
+        if (scrollTrigDir != dir) { scrollTrigDir = dir; scrollTrigF = 0f }
+        if (still) scrollTrigF += dtMs / STRIP_TRIG_MS
+        else scrollTrigF = maxOf(0f, scrollTrigF - dtMs / 600f)
+        if (scrollTrigF >= 1f) { scrollTrigF = 1f; scrollEngage = dir }
+    }
+
+    /** Panel open/close fade state (GL thread). */
+    private var browFadeVis = false
+    private var browFadeT0 = 0L
+    private var menuFadeVis = false
+    private var menuFadeT0 = 0L
+
+    /** Fast fade alpha for a panel: smoothstep over PANEL_FADE_MS after
+     *  each visibility transition. `which=true` = browser, false = menu. */
+    private fun fadeAlpha(want: Boolean, which: Boolean): Float {
+        val t0: Long
+        if (which) {
+            if (want != browFadeVis) { browFadeVis = want; browFadeT0 = now() }
+            t0 = browFadeT0
+        } else {
+            if (want != menuFadeVis) { menuFadeVis = want; menuFadeT0 = now() }
+            t0 = menuFadeT0
+        }
+        val t = ((now() - t0).toFloat() / PANEL_FADE_MS).coerceIn(0f, 1f)
+        val s = t * t * (3f - 2f * t)
+        return if ((if (which) browFadeVis else menuFadeVis)) s else 1f - s
+    }
+
     private fun ensureVisible() {
-        if (highlight < scroll) scroll = highlight
-        else if (highlight >= scroll + VISIBLE_ROWS) scroll = highlight - VISIBLE_ROWS + 1
-        scroll = scroll.coerceIn(0, maxOf(0, browserRows.size - VISIBLE_ROWS))
+        val pin = pinTopRows.coerceIn(0, 2)
+        val win = if (pin > 0) winRows(pin) else VISIBLE_ROWS
+        val maxS = maxOf(0, browserRows.size - pin - win).toFloat()
+        scrollPos = scrollPos.coerceIn(0f, maxS)
+        val h = highlight
+        if (h < 0 || h >= browserRows.size) return
+        if (h < pin) return // pinned row: always visible, never scrolls
+        val base = scrollPos.toInt()
+        if (h < pin + base) scrollPos = (h - pin).toFloat()
+        else if (h >= pin + base + win) scrollPos = (h - pin - win + 1).toFloat()
+        scrollPos = scrollPos.coerceIn(0f, maxS)
     }
 
     private fun now() = System.currentTimeMillis()
@@ -1436,11 +1593,17 @@ void main(){
         else kotlin.math.abs(menuAngleDown).coerceIn(10f, 60f)
     private fun menuIsBelow(): Boolean = !menuSideUp
     /** Menu panel elevation: the whole panel floats above the open angle
-     *  (center = angle + 12°, half-height ~10°), so looking at any button
-     *  keeps you above the trigger. No hysteresis anywhere: open at/above
-     *  the angle, closed below it. */
-    private fun menuElevDeg(): Float =
-        ((menuOpenAngle() + 12f).coerceAtMost(85f)) * (if (menuIsBelow()) -1f else 1f)
+     *  so looking at any button keeps you above the trigger. The center
+     *  preserves the long-standing bottom-edge clearance (open angle + 12°
+     *  minus the old half-height): the taller undistorted panel grows
+     *  upward, so trigger margins are bit-identical. No hysteresis
+     *  anywhere: open at/above the angle, closed below it. */
+    private fun menuElevDeg(): Float {
+        val newHalfDeg = Math.toDegrees(kotlin.math.atan((menuHalfH() / panelDistM).toDouble())).toFloat()
+        val oldHalfDeg = Math.toDegrees(kotlin.math.atan(0.093)).toFloat() // 0.465*0.20: old halfH/dist
+        return ((menuOpenAngle() + 12f + newHalfDeg - oldHalfDeg).coerceAtMost(85f)) *
+            (if (menuIsBelow()) -1f else 1f)
+    }
     /** Animated elevation for the ⇅ flip: smooth sweep through the middle,
      *  settling on the target side. */
     fun menuElevCurrent(): Float {
@@ -1451,8 +1614,13 @@ void main(){
         val s = t * t * (3f - 2f * t)
         return menuAnimFrom + (target - menuAnimFrom) * s
     }
-    private fun menuHalfW(): Float = panelDistM * 0.465f
-    private fun menuHalfH(): Float = menuHalfW() * 0.20f
+    /** Menu width matches the settings panel (same world width at the same
+     *  distance, so the same apparent size/distance), and the height
+     *  matches the menu bitmap aspect (1024×352) so glyphs draw
+     *  undistorted — the old 5.0-vs-2.9 mismatch stretched everything
+     *  ~1.7× wide. */
+    private fun menuHalfW(): Float = panelHalfW()
+    private fun menuHalfH(): Float = menuHalfW() * (352f / 1024f)
 
     // ---------- play menu ----------
 
@@ -1627,16 +1795,18 @@ void main(){
         val tilt = Math.toDegrees(kotlin.math.atan2(up[2].toDouble(), up[1].toDouble())).toFloat()
         val ang = menuOpenAngle()
         val below = menuIsBelow()
-        // Open exactly at the angle; close ~4.2° lower (a third of the
-        // original 12.5°). The band is load-bearing, not hysteresis-
-        // for-comfort: reaching the panel ends dips the tilt reading
-        // ~15-20° (head-yaw cone geometry), so too tight a close
-        // threshold strobes the menu (and every dwell) while operating
-        // the end buttons. Opening is still exact at the angle.
-        // Closing additionally needs 400ms continuously below, killing
-        // sensor-noise flapping at the boundary.
+        // Open exactly at the angle; close a small band below it (see
+        // closeAt). Closing additionally needs 400ms continuously below,
+        // killing sensor-noise flapping at the boundary.
         val openAt = ang
-        val closeAt = (ang - 12.5f / 3f).coerceAtLeast(2.5f)
+        // Close below the open angle (not at the panel edge): the panel
+        // stays put while the gaze wanders around and below it, and only
+        // hides once the gaze drops past the band and stays there 400ms.
+        // The band is deliberately small (1°) but nonzero — tilt dips
+        // ~15-20° while operating the end buttons, so closing at the panel
+        // edge strobes the menu mid-dwell and forces a re-dip + re-aim to
+        // bring it back. Opening is still exact at the angle.
+        val closeAt = (ang - 1f).coerceAtLeast(2.5f)
         val above = if (!below) tilt >= (if (!menuOpen) openAt else closeAt)
             else tilt <= -(if (!menuOpen) openAt else closeAt)
         val isUp: Boolean
@@ -1875,11 +2045,12 @@ void main(){
         return Mesh(fb(verts), fb(texs), sb(idx.toShortArray()), idx.size)
     }
 
-    private fun drawMesh2d(m: Mesh, texId: Int, mat: FloatArray, warpCx: Float, aspect: Float) {
+    private fun drawMesh2d(m: Mesh, texId: Int, mat: FloatArray, warpCx: Float, aspect: Float, alpha: Float = 1f) {
         GLES20.glUseProgram(prog2d)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texId)
         GLES20.glUniform1i(uTex2d, 0)
+        GLES20.glUniform1f(uAlpha2d, alpha.coerceIn(0f, 1f))
         GLES20.glUniformMatrix4fv(uMvp2d, 1, false, mat, 0)
         setWarp(uWarpOn2d, uWarpCx2d, uWarpK12d, uWarpK22d, uWarpAspect2d, warpCx, aspect)
         GLES20.glEnableVertexAttribArray(aPos2d)
@@ -1894,7 +2065,7 @@ void main(){
     private var browserGrid: Mesh? = null
     private var browserGridD = -1f
     private var browserGridEl = -999f
-    private fun drawBrowser(warpCx: Float, aspect: Float) {
+    private fun drawBrowser(warpCx: Float, aspect: Float, alpha: Float = 1f) {
         maybeUploadBrowser()
         val d = panelDistM; val hw = panelHalfW(); val hh = panelHalfH()
         // rotation-only UI matrix: identical in both eyes, always fuses.
@@ -1920,7 +2091,7 @@ void main(){
             browserGridD = d; browserGridEl = el
             FileLog.i("DomeVR-browser", "grid rebuild d=$d el=$el")
         }
-        drawMesh2d(browserGrid!!, browserTexId, flatM, warpCx, aspect)
+        drawMesh2d(browserGrid!!, browserTexId, flatM, warpCx, aspect, alpha)
     }
 
     private fun makeReticle(color: Int): Int {
@@ -2021,20 +2192,18 @@ void main(){
     private fun maybeUploadBrowser() {
         ensureVisible()
         val rows = browserRows
-        val end = (scroll + VISIBLE_ROWS).coerceAtMost(rows.size)
-        var h = browserTitle.hashCode() * 31 + scroll
-        for (i in scroll until end) {
-            h = h * 31 + rows[i].label.hashCode() * 7 + rows[i].meta.hashCode() + rows[i].segSelected
-            // shaping previews change with weights/toggles: sample magnitudes into the hash
-            val pm = rows[i].previewMags
-            if (pm != null) {
-                var j = 0
-                while (j < pm.size) { h = h * 31 + (pm[j] * 1000).toInt(); j += 7 }
-                h = h * 31 + (rows[i].previewHull?.size ?: 0)
-            }
-        }
+        val pin = pinTopRows.coerceIn(0, 2)
+        val stm = pin > 0 // strips mode: file pages only
+        val win = if (stm) winRows(pin) else VISIBLE_ROWS
+        val base = scrollPos.toInt()
+        val winStart = (pin + base).coerceAtMost(rows.size)
+        val winEnd = (winStart + win + (if (stm) 1 else 0)).coerceAtMost(rows.size)
+        var h = browserTitle.hashCode() * 31 + (if (stm) (scrollPos * ROW_H).toInt() else base) + pin * 7919
+        for (i in 0 until pin.coerceAtMost(rows.size)) h = h * 31 + rowHash(rows, i)
+        for (i in winStart until winEnd) h = h * 31 + rowHash(rows, i)
         h = h * 31 + highlight + (if (inXZone) 1009 else 0) +
             (if (sliderHoverU >= 0f) (sliderHoverU * 128).toInt() else 0)
+        if (stm) h += scrollEngage * 131071 + scrollTrigDir * 1031 + (scrollTrigF * 32).toInt()
         if (h == lastPanelHash && browserBitmap != null) return
         lastPanelHash = h
         val bmp = Bitmap.createBitmap(TEX, TEX, Bitmap.Config.ARGB_8888)
@@ -2043,7 +2212,7 @@ void main(){
         val p = Paint(Paint.ANTI_ALIAS_FLAG)
         p.color = Color.WHITE; p.textSize = 44f
         c.drawText(browserTitle.take(30), 40f, 72f, p)
-        // X close button, top right (hit zone u>0.90, above ROWS_Y0)
+        // X close button, top right of the title bar (hit zone u>0.90, y<TITLE_Y1).
         if (inXZone) {
             p.color = Color.rgb(30, 58, 95)
             c.drawRect(920f, 16f, 1004f, 96f, p)
@@ -2051,8 +2220,82 @@ void main(){
         p.color = Color.WHITE; p.textSize = 44f; p.textAlign = Paint.Align.CENTER
         c.drawText("✕", 962f, 72f, p)
         p.textAlign = Paint.Align.LEFT
-        var y = ROWS_Y0
-        for (i in scroll until end) {
+        if (stm) {
+            // File pages: pinned nav rows, scroll strips, fractional window.
+            val upY0 = upStripY0(pin); val rY0 = rowsY0(pin); val dnY0 = downStripY0(pin)
+            val scrollable = rows.size > pin + win
+            var py = PIN_Y0.toFloat()
+            for (i in 0 until pin.coerceAtMost(rows.size)) {
+                drawBrowserRow(c, p, rows, i, py.toInt())
+                py += ROW_H
+            }
+            if (scrollable) drawScrollStrip(c, p, upY0, -1)
+            val fracPx = scrollPos * ROW_H - base * ROW_H
+            c.save()
+            c.clipRect(0f, rY0, TEX.toFloat(), rY0 + win * ROW_H)
+            c.translate(0f, -fracPx)
+            var y = rY0
+            for (i in winStart until winEnd) {
+                drawBrowserRow(c, p, rows, i, y.toInt())
+                y += ROW_H
+            }
+            c.restore()
+            if (scrollable) drawScrollStrip(c, p, dnY0, 1)
+        } else {
+            // Settings pages: plain fixed window, no strips.
+            var y = ROWS_Y0
+            for (i in winStart until winEnd) {
+                drawBrowserRow(c, p, rows, i, y)
+                y += ROW_H
+            }
+        }
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, browserTexId)
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+        browserBitmap?.recycle()
+        browserBitmap = bmp
+    }
+
+    /** Hash contribution of one browser row (matches what drawBrowserRow paints). */
+    private fun rowHash(rows: List<BrowserRow>, i: Int): Int {
+        var h = rows[i].label.hashCode() * 7 + rows[i].meta.hashCode() + rows[i].segSelected
+        // shaping previews change with weights/toggles: sample magnitudes into the hash
+        val pm = rows[i].previewMags
+        if (pm != null) {
+            var j = 0
+            while (j < pm.size) { h = h * 31 + (pm[j] * 1000).toInt(); j += 7 }
+            h = h * 31 + (rows[i].previewHull?.size ?: 0)
+        }
+        return h
+    }
+
+    /** Pinned scroll strip (file pages only): wide bar with
+     *  trigger-progress fill while earning engagement, solid while
+     *  gliding, dimmed at the travel end. */
+    private fun drawScrollStrip(c: Canvas, p: Paint, y0: Float, dir: Int) {
+        val pin = pinTopRows.coerceIn(0, 2)
+        val maxS = maxOf(0, browserRows.size - pin - winRows(pin)).toFloat()
+        val atEnd = (dir < 0 && scrollPos <= 0f) || (dir > 0 && scrollPos >= maxS)
+        val active = scrollEngage == dir
+        p.color = when {
+            atEnd -> Color.rgb(30, 41, 55)
+            active -> Color.rgb(8, 145, 178)
+            else -> Color.rgb(30, 58, 95)
+        }
+        c.drawRect(20f, y0, 1004f, y0 + STRIP_H, p)
+        val prog = if (scrollTrigDir == dir && !active) scrollTrigF.coerceIn(0f, 1f) else 0f
+        if (prog > 0f) {
+            p.color = Color.rgb(8, 145, 178)
+            c.drawRect(20f, y0, 20f + 984f * prog, y0 + STRIP_H, p)
+        }
+        p.color = if (atEnd) Color.rgb(100, 116, 139) else Color.WHITE
+        p.textSize = 30f; p.textAlign = Paint.Align.CENTER
+        val g = if (dir < 0) "▲" else "▼"
+        c.drawText("$g  scroll ${if (dir < 0) "up" else "down"}  $g", 512f, y0 + 38f, p)
+        p.textAlign = Paint.Align.LEFT
+    }
+
+    /** Single browser list row at panel y (int, TEX coords). */
+    private fun drawBrowserRow(c: Canvas, p: Paint, rows: List<BrowserRow>, i: Int, y: Int) {
             val r = rows[i]
             if (i == highlight) {
                 p.color = Color.rgb(30, 58, 95)
@@ -2165,12 +2408,6 @@ void main(){
                 c.drawText("    ${r.meta.take(56)}", 44f, (y + 58).toFloat(), p)
             }
             }
-            y += ROW_H
-        }
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, browserTexId)
-        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
-        browserBitmap?.recycle()
-        browserBitmap = bmp
     }
 
     override fun onFrameAvailable(st: SurfaceTexture?) { frameAvailable = true; arrivedFrames++ }
@@ -2179,7 +2416,7 @@ void main(){
     private var menuGrid: Mesh? = null
     private var menuGridD = -1f
     private var menuGridEl = -999f
-    private fun drawMenuPanel(warpCx: Float, aspect: Float) {
+    private fun drawMenuPanel(warpCx: Float, aspect: Float, alpha: Float = 1f) {
         maybeUploadMenu()
         // browser-pipeline panel (FBO + flatM with convergence): fuses
         // exactly like the browser panel. Animated elevation: the grid
@@ -2205,7 +2442,7 @@ void main(){
             )
             menuGridD = d; menuGridEl = el
         }
-        drawMesh2d(menuGrid!!, menuTexId, flatM, warpCx, aspect)
+        drawMesh2d(menuGrid!!, menuTexId, flatM, warpCx, aspect, alpha)
     }
 
     private fun maybeUploadMenu() {

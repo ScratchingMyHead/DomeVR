@@ -716,6 +716,12 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                     }
                 }
             }
+        } else if (loc !is Loc.Smb && loc !is Loc.Local && loc !is Loc.Saf && loc !is Loc.Root) {
+            // Playing file isn't in the folder queue (single-file play) AND
+            // we're sitting on a non-file page (settings/shaping/sensors):
+            // without this the 📁 button would just re-show that stale page
+            // instead of the file browser. Fall back to the server list.
+            loc = Loc.Root
         }
         refresh()
     }
@@ -738,6 +744,12 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
     private fun pushRows(title: String, status: String, r: List<Row>) {
         rows = r
         renderer.browserTitle = title
+        // File pages lead with home + up: pin both above the scroll-up
+        // strip so nav stays reachable without scrolling back to the top.
+        // Settings/shaping/sensor pages get no strips (pin 0).
+        renderer.pinTopRows =
+            if (r.size >= 2 && r[0].action == "home:" && r[1].action == "up:") 2
+            else 0
         renderer.browserRows = r.map {
             VrRenderer.BrowserRow(it.label, it.meta, it.kind, it.slideKey, it.slideMin, it.slideMax, it.slideVal, it.slideFmt,
                 it.segLabels, it.segActions, it.segSelected,
@@ -890,11 +902,6 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 VrRenderer.SlideFormat(" mm", 0, 1f, 0f, 1f)),
             slide("Panel distance", "${String.format("%.1f", settings.panelDistM)} m", "panel", 1.2f, 5f, settings.panelDistM,
                 VrRenderer.SlideFormat(" m", 1, 1f, 0f, 0.1f)),
-            slide("Gaze delay", "${settings.dwellMs} ms", "dwell", 400f, 4000f, settings.dwellMs.toFloat(),
-                VrRenderer.SlideFormat(" ms", 0, 1f, 0f, 100f)),
-            Row("Swap eyes", if (settings.swapEyes) "ON" else "off", VrRenderer.BrowserRow.ACTION, action = "set:swap"),
-            Row("Pin video in front", if (settings.pinVideo) "ON (no look-around)" else "off (look-around)",
-                VrRenderer.BrowserRow.ACTION, action = "set:pin"),
         )
         pushRows("Video settings", "stare at a bar position to jump there", r)
     }
