@@ -79,9 +79,9 @@ class SettingsStore(ctx: Context) {
         get() = p.getInt("buffer_kb", 256).coerceIn(32, 2048)
         set(v) { p.edit().putInt("buffer_kb", v).apply() }
     // --- optics / comfort ---
-    /** Vertical FOV degrees per eye. Cardboard viewers are usually 60-75. */
+    /** Vertical FOV degrees per eye. Baseline forces 60. */
     var fovDeg: Float
-        get() = p.getFloat("fov", 68f).coerceIn(40f, 110f)
+        get() = p.getFloat("fov", 60f).coerceIn(40f, 110f)
         set(v) { p.edit().putFloat("fov", v).apply() }
     /** Full interpupillary distance in mm. */
     var ipdMm: Float
@@ -95,9 +95,10 @@ class SettingsStore(ctx: Context) {
     var panelDistM: Float
         get() = p.getFloat("panel_d", 2.4f).coerceIn(1.2f, 5f)
         set(v) { p.edit().putFloat("panel_d", v).apply() }
-    /** Video scale (flat screen size / sphere radius multiplier). */
+    /** Video scale / zoom number z (frustum window 1/z, §5). Range 0.3-10
+     *  both directions; baseline forces 1. */
     var videoZoom: Float
-        get() = p.getFloat("zoom", 1f).coerceIn(0.3f, 2.5f)
+        get() = p.getFloat("zoom", 1f).coerceIn(0.3f, 10f)
         set(v) { p.edit().putFloat("zoom", v).apply() }
     /** Gaze dwell-to-select in ms. */
     var dwellMs: Long
@@ -173,6 +174,74 @@ class SettingsStore(ctx: Context) {
     var fisheyeMirrorR: Boolean
         get() = p.getBoolean("fish_mirror_r", false)
         set(v) { p.edit().putBoolean("fish_mirror_r", v).apply() }
+    // --- viewer profile (§3, §10): optics key off the viewer lens
+    // separation, cameras sit at the wearer's IPD; the two are independent.
+    /** Eye-to-screen viewing depth in mm. Baseline forces 39. */
+    var eyeDepthMm: Float
+        get() = p.getFloat("eye_depth", 39f).coerceIn(10f, 200f)
+        set(v) { p.edit().putFloat("eye_depth", v).apply() }
+    /** Dome mesh radius in meters. 50 by construction (stereo parallax
+     *  absent); tunable down to ~1 m for eye-offset parallax experiments.
+     *  Baseline forces 50. */
+    var domeRadiusM: Float
+        get() = p.getFloat("dome_radius", 50f).coerceIn(1f, 80f)
+        set(v) { p.edit().putFloat("dome_radius", v).apply() }
+    /** Dome node offsets in meters (up / forward). Applied to the video
+     *  mesh model matrix for testing. Baseline forces 0.5/0.5. */
+    var domeOffsetUpM: Float
+        get() = p.getFloat("dome_off_up", 0.5f).coerceIn(-5f, 5f)
+        set(v) { p.edit().putFloat("dome_off_up", v).apply() }
+    var domeOffsetFwdM: Float
+        get() = p.getFloat("dome_off_fwd", 0.5f).coerceIn(-5f, 5f)
+        set(v) { p.edit().putFloat("dome_off_fwd", v).apply() }
+    /** Dome node scale (model matrix). Baseline forces 1. */
+    var domeNodeScale: Float
+        get() = p.getFloat("dome_scale", 1f).coerceIn(0.1f, 4f)
+        set(v) { p.edit().putFloat("dome_scale", v).apply() }
+    /** Extra frustum-width multiplier about the lens-center pivot (testing;
+     *  composes with the zoom window). Not baseline-forced. */
+    var frustumWidthMul: Float
+        get() = p.getFloat("frustum_w", 1f).coerceIn(0.3f, 3f)
+        set(v) { p.edit().putFloat("frustum_w", v).apply() }
+    /** Manual lens-separation trim in mm (±10, persists once set). Rides
+     *  on top of the zoom-derived base (63 mm at zoom ≤1, 73 mm at zoom
+     *  ≥2.5, linear between). Never baseline-forced. */
+    var lensSepTrimMm: Float
+        get() = p.getFloat("lens_trim", 0f).coerceIn(-10f, 10f)
+        set(v) { p.edit().putFloat("lens_trim", v).apply() }
+    /** Convergence trim: uniform clip-space offset per eye (±0.15).
+     *  Positive converges the halves. Baseline forces -0.040;
+     *  live-tunable after. */
+    var convTrim: Float
+        get() = p.getFloat("conv_trim", -0.04f).coerceIn(-0.15f, 0.15f)
+        set(v) { p.edit().putFloat("conv_trim", v).apply() }
+    // --- startup baseline (§10) ---
+    /** Last baseline fire, epoch ms (0 = never). */
+    var baselineAt: Long
+        get() = p.getLong("baseline_at", 0L)
+        set(v) { p.edit().putLong("baseline_at", v).apply() }
+    /** Baseline has fired at least once (fresh-install detection). */
+    var baselineEver: Boolean
+        get() = p.getBoolean("baseline_ever", false)
+        set(v) { p.edit().putBoolean("baseline_ever", v).apply() }
+
+    /** Startup baseline (§10): forces the calibration table, persists
+     *  eye separation / projection / stereo / menu timings and everything
+     *  else unlisted by leaving it untouched. Records the fire time. */
+    fun fireBaseline(nowMs: Long) {
+        lensK1 = 0.34f; lensK2 = 0.55f; lensK3 = 0f
+        lensCy = 0.5f
+        eyeDepthMm = 39f
+        videoZoom = 1f
+        fovDeg = 60f
+        pinVideo = false; swapEyes = false; testSweep = false
+        domeRadiusM = 50f
+        domeOffsetUpM = 0.5f; domeOffsetFwdM = 0.5f
+        domeNodeScale = 1f
+        convTrim = -0.04f
+        baselineAt = nowMs
+        baselineEver = true
+    }
     /** Look-up tilt (deg, 10..60) that opens the VR play menu when it is on top. */
     var menuAngleUp: Float
         get() = p.getFloat("menu_angle_up",

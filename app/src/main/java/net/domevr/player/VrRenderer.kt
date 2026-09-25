@@ -331,10 +331,30 @@ class VrRenderer(
     // computed fresh every frame by videoFrustum() into projEyeVM.
     private val projEyeVM = FloatArray(16)
     private val viewM = FloatArray(16)
-    /** Per-eye convergence shift, NDC units (half-screen spans 2.0).
-     *  >0 pulls both image centers toward the middle (for narrow IPD).
-     *  Computed in applyOptics as (1 - ipd/spacing). */
-    @Volatile var convShiftNdc = 0f
+    /** Effective viewer lens separation, mm (activity: zoom base + trim).
+     *  Frustum millimeter distances and warp centers derive from this;
+     *  cameras always sit at the wearer's IPD (§3, §10). */
+    @Volatile var lensSepMm = 63f
+    /** Eye-to-screen viewing depth, mm. Baseline forces 39 (§10). */
+    @Volatile var eyeDepthMm = 39f
+    /** Dome mesh radius, meters. 50 by construction; tunable to ~1 m for
+     *  eye-offset parallax experiments (§2). Baseline forces 50. */
+    @Volatile var domeRadiusM = 50f
+    /** Dome node transform for testing (§10 baseline 0.5/0.5 m offsets,
+     *  scale 1): translation up/forward plus uniform scale, applied to the
+     *  video mesh model matrix. Identity at 0/0/1. */
+    @Volatile var domeOffsetUpM = 0.5f
+    @Volatile var domeOffsetFwdM = 0.5f
+    @Volatile var domeNodeScale = 1f
+    /** Extra frustum-width multiplier about the lens-center pivot (testing;
+     *  composes with the zoom window). Identity at 1. */
+    @Volatile var frustumWidthMul = 1f
+    private val modelM = FloatArray(16)
+    /** Convergence trim: uniform clip-space offset per eye. An m[8]
+     *  addition shifts the image by minus that amount in NDC x, so the
+     *  left eye takes -ct: positive trim converges the halves (§10).
+     *  Baseline -0.040; live-tunable after. */
+    @Volatile var convTrimNdc = -0.04f
     /** Play-menu trigger tilts: up opens the top menu, down the bottom menu. */
     @Volatile var menuAngleUp = 40f
     @Volatile var menuAngleDown = -40f
@@ -522,9 +542,12 @@ class VrRenderer(
 
     companion object {
         const val MENU_BUTTONS = 14
-        // Cardboard v1 eye-to-screen distance (mm). r_tanAngle = offset_m /
-        // eyeToScreen is the unit system the distortion coefficients live in.
-        private const val EYE_TO_SCREEN_MM = 84.3f
+        // Viewer-profile coefficients for the post-distortion frustum
+        // halves (§3): fixed 0.34/0.55, independent of the live rendering
+        // warp. Each half-angle capped at 50° per side.
+        private const val PROF_K1 = 0.34f
+        private const val PROF_K2 = 0.55f
+        private const val MAX_HALF_DEG = 50f
         const val TEX = 1024
         const val ROW_H = 64
         // ---- browser panel layout (TEX coords, y down) ----
@@ -891,7 +914,8 @@ void main(){
         // Video uses the off-center physical frustum (§3), computed per eye
         // inside the loop below — never the symmetric matrix.
         val cur: Mode = mode
-        val wantMeshKey = projection.name + "|sh=" + shapingRevision.toString()
+        val wantMeshKey = projection.name + "|sh=" + shapingRevision.toString() +
+            "|r=" + domeRadiusM.coerceIn(1f, 80f).toString()
         if (meshKey != wantMeshKey) {
             mesh = buildMesh(projection); meshKey = wantMeshKey
         }
@@ -914,15 +938,17 @@ void main(){
             val eye = if (swap) 1 - vp else vp
             GLES20.glViewport(vp * w / 2, 0, w / 2, h)
             // Convergence: shift each eye's image toward its half-center so
-            // the two centers land at the configured IPD apart. Baking the
-            // NDC offset into projEye[8] moves the image uniformly, at any
-            // depth (NDC shift o moves every pixel o*halfScreenPx).
-            // eye 0 (left half) shifts right (+), eye 1 shifts left (-).
+            // Convergence trim (§10): uniform clip-space offset per eye.
+            // Polarity matches the video frustum (left eye -ct): positive
+            // trim converges the halves. Baking the NDC offset into
+            // projEye[8] moves the image uniformly, at any depth (NDC shift
+            // o moves every pixel o*halfScreenPx).
             System.arraycopy(projM, 0, projEyeM, 0, 16)
-            projEyeM[8] = if (eye == 0) -convShiftNdc else convShiftNdc
+            val browCt = convTrimNdc.coerceIn(-0.15f, 0.15f)
+            projEyeM[8] = if (eye == 0) -browCt else browCt
             Matrix.multiplyMM(flatM, 0, projEyeM, 0, effM, 0)
-            // Video: off-center physical frustum for this eye (§3, §5).
-            // No NDC convergence hack here — the asymmetry is the frustum.
+            // Video: off-center physical frustum for this eye (§3, §5),
+            // trim included by videoFrustum itself.
             videoFrustum(eye, w, h, projEyeVM)
             if (cur == Mode.VIDEO && pinVideo) {
                 // pinned: screen fixed dead-ahead, only eye shift
@@ -932,8 +958,14 @@ void main(){
             }
             // eye-shifted view (parallel cameras)
             Matrix.translateM(mvpM, 0, viewM, 0, if (eye == 0) eyeHalfM else -eyeHalfM, 0f, 0f)
-            Matrix.multiplyMM(tmpM, 0, projEyeVM, 0, mvpM, 0)
-            System.arraycopy(tmpM, 0, mvpM, 0, 16)
+            // dome node transform (testing offsets + scale): model = T·S,
+            // identity at 0/0/1 so the panoramic path is unaffected by default
+            Matrix.setIdentityM(modelM, 0)
+            Matrix.translateM(modelM, 0, 0f, domeOffsetUpM, -domeOffsetFwdM)
+            val dns = domeNodeScale.coerceIn(0.1f, 4f)
+            Matrix.scaleM(modelM, 0, dns, dns, dns)
+            Matrix.multiplyMM(tmpM, 0, mvpM, 0, modelM, 0)
+            Matrix.multiplyMM(mvpM, 0, projEyeVM, 0, tmpM, 0)
             // Lens correction as a FINAL pass on a flat quad: the scene
             // renders undistorted into the eye FBO (same aspect as the
             // screen half, so all MVP math is unchanged), then the
@@ -1107,18 +1139,20 @@ void main(){
     /** Fullscreen quad resampling the eye FBO with barrel UVs. Flat quad
      *  at safe depth: no clipping-boundary issues by construction. */
     /** Per-eye optical centers in quad UV (phone center = inner edge of
-     *  each half; lens sits IPD/2 from phone center). Refreshed per frame
-     *  from the live surface size, display density and IPD — narrow phones
-     *  genuinely put the centers near the outer edges, that is correct. */
+     *  each half; lens sits at half the viewer lens separation from phone
+     *  center). Refreshed per frame from surface size, display density and
+     *  lens separation — narrow phones genuinely put the centers near the
+     *  outer edges, that is correct. */
     private fun refreshWarpDims(w: Int, h: Int) {
         val mmPx = mmPerPx
         if (mmPx <= 0f) return
         val halfWmm = (w / 2f) * mmPx
         val fullHmm = h.toFloat() * mmPx
         if (halfWmm <= 0f || fullHmm <= 0f) return
-        tanPerU = halfWmm / EYE_TO_SCREEN_MM
-        tanPerV = fullHmm / EYE_TO_SCREEN_MM
-        val k = (eyeHalfM * 1000f / halfWmm).coerceIn(0.02f, 0.98f)
+        val depthMm = eyeDepthMm.coerceIn(10f, 200f)
+        tanPerU = halfWmm / depthMm
+        tanPerV = fullHmm / depthMm
+        val k = (lensSepMm.coerceIn(20f, 100f) / 2f / halfWmm).coerceIn(0.02f, 0.98f)
         lensCxL = 1f - k
         lensCxR = k
     }
@@ -1146,63 +1180,85 @@ void main(){
         GLES20.glDisableVertexAttribArray(aTexDist)
     }
 
-    /** Split zoom range (§5): frustum scale owns zoom >= 1, texture
-     *  minification owns zoom < 1. Shared by both video sampling paths. */
-    private fun zoomOutF(): Float = zoom.coerceIn(0.3f, 2.5f).coerceAtMost(1f)
-    private fun zoomInF(): Float = zoom.coerceIn(0.3f, 2.5f).coerceAtLeast(1f)
+    /** Zoom number z for the finite FLAT quad: texture magnification about
+     *  the half-image center (the flat quad keeps texture zoom, §5). Domes
+     *  narrow the frustum instead and always upload 1 here. */
+    private fun flatZoomF(): Float = zoom.coerceIn(0.3f, 10f)
 
     /** Per-eye off-center perspective from the viewer profile (§3).
      *
      *  Each eye is a parallel camera: the shared head orientation plus a
-     *  lateral translation of half the inter-ocular distance (applied by
-     *  the caller). The frustum is asymmetric: each half-screen's physical
-     *  extent (from display density) is measured relative to that eye's
-     *  position at lens-to-screen depth, so the two halves meet at the
-     *  configured eye separation and the image centers land on the lenses.
-     *  Near/far are 0.1/100 m — ample for a dome at tens of meters.
+     *  lateral translation of half the wearer's IPD (applied by the
+     *  caller — cameras always sit at IPD). The frustum halves derive from
+     *  the viewer lens separation: each screen-edge distance d (mm, from
+     *  this eye's lens-center ray at eye-to-screen depth) becomes
+     *  atan(r·(1+K1·r²+K2·r⁴)) with the fixed profile coefficients, capped
+     *  at 50° per side. Near/far 0.1/100 m.
      *
-     *  Zoom-in (§5) scales the frustum symmetrically about its own center;
-     *  zoom-out never reaches this function (zoomInF() clamps at 1), so the
-     *  frustum only ever stays the same or gets narrower, never wider.
+     *  Zoom rescales the halves symmetrically about the
+     *  LENS-CENTER pivot (optical-center half-UV through the unscaled
+     *  frustum) — never the frustum center, which would force divergence.
+     *  Zoom number z sets the window to 1/z over the full 0.3–10 range in
+     *  both directions (the finite FLAT quad keeps texture zoom instead:
+     *  its frustum stays at window 1). Convergence trim lands as a uniform
+     *  clip-space offset afterwards (§10).
      */
-    /** Viewer profile screen-to-lens depth (mm). The eye frustum halves
-     *  are measured at this depth (GVR lens_distortion convention), NOT at
-     *  the eye-to-screen depth used for distortion r units. */
-    private val SCREEN_TO_LENS_MM = 39f
     private fun videoFrustum(eye: Int, w: Int, h: Int, out: FloatArray) {
         val near = 0.1f; val far = 100f
         val mmPx = mmPerPx.coerceAtLeast(1e-3f)
-        val depthMm = SCREEN_TO_LENS_MM
+        val depthMm = eyeDepthMm.coerceIn(10f, 200f)
         val fullWmm = w.toFloat() * mmPx
         val fullHmm = h.toFloat() * mmPx
-        val eyeXmm = (if (eye == 0) -eyeHalfM else eyeHalfM) * 1000f
-        val eyeYmm = (lensCy.coerceIn(0f, 1f) - 0.5f) * fullHmm
-        // This eye's half-screen extent, in mm right/up of phone center.
-        val sL = if (eye == 0) -fullWmm / 2f else 0f
-        val sR = if (eye == 0) 0f else fullWmm / 2f
-        val sB = -fullHmm / 2f
-        val sT = fullHmm / 2f
-        var l = (sL - eyeXmm) * near / depthMm
-        var r = (sR - eyeXmm) * near / depthMm
-        var b = (sB - eyeYmm) * near / depthMm
-        var t = (sT - eyeYmm) * near / depthMm
-        // User-FOV fit composed with zoom-in: the physical frustum is
-        // scaled symmetrically about its own center so the vertical field
-        // matches fovDeg (the same setting that drives the menu panels),
-        // preserving the off-center asymmetry. Zoom-in only narrows
-        // further; zoom < 1 is owned by texture-space minification and
-        // never widens this.
-        val physTanV = (fullHmm / 2f) / depthMm
-        val s = if (physTanV > 1e-4f) {
-            val wantTanV = kotlin.math.tan(Math.toRadians((fovDeg.coerceIn(40f, 110f) / 2f).toDouble())).toFloat()
-            (wantTanV / physTanV / zoomInF()).coerceIn(0.15f, 5f)
-        } else {
-            (1f / zoomInF()).coerceIn(0.15f, 5f)
+        if (fullWmm <= 0f || fullHmm <= 0f) {
+            Matrix.perspectiveM(out, 0, 60f, 1f, near, far)
+            return
         }
-        val cx = (l + r) / 2f; val cy = (b + t) / 2f
-        val hw = (r - l) / 2f * s; val hh = (t - b) / 2f * s
-        l = cx - hw; r = cx + hw; b = cy - hh; t = cy + hh
+        val lensHalf = lensSepMm.coerceIn(20f, 100f) / 2f
+        // Screen-edge distances from the lens-center ray, mm.
+        val dIn = lensHalf.coerceAtLeast(0f)
+        val dOut = (fullWmm / 2f - lensHalf).coerceAtLeast(1f)
+        val eyeYmm = (lensCy.coerceIn(0f, 1f) - 0.5f) * fullHmm
+        val dT = (fullHmm / 2f - eyeYmm).coerceAtLeast(1f)
+        val dB = (fullHmm / 2f + eyeYmm).coerceAtLeast(1f)
+        fun halfAngle(d: Float): Float {
+            val r = d / depthMm
+            val distorted = r * (1f + PROF_K1 * r * r + PROF_K2 * r * r * r * r)
+            return Math.toDegrees(kotlin.math.atan(distorted.toDouble())).toFloat()
+                .coerceIn(1f, MAX_HALF_DEG)
+        }
+        val aIn = halfAngle(dIn); val aOut = halfAngle(dOut)
+        val aT = halfAngle(dT); val aB = halfAngle(dB)
+        fun tan(d: Float) = kotlin.math.tan(Math.toRadians(d.toDouble())).toFloat()
+        // Unscaled asymmetric frustum at near.
+        val l0: Float; val r0: Float
+        if (eye == 0) { l0 = -tan(aOut) * near; r0 = tan(aIn) * near }
+        else { l0 = -tan(aIn) * near; r0 = tan(aOut) * near }
+        val b0 = -tan(aB) * near; val t0 = tan(aT) * near
+        // Lens-center pivot: optical-center half-UV through the unscaled
+        // frustum (same fraction the warp pass uses for its centers).
+        val cxH = (1f - lensHalf / (fullWmm / 2f)).coerceIn(0f, 1f)
+        val cyH = lensCy.coerceIn(0f, 1f)
+        val px = l0 + cxH * (r0 - l0)
+        val py = b0 + cyH * (t0 - b0)
+        // Combined scale about the pivot: zoom window 1/z only. The frustum
+        // stays profile-native (no FOV remap): zoom 1 IS the full profile
+        // window, so zoom labels mean what they say. fovDeg drives only
+        // the browser UI panels.
+        var s = 1f
+        if (projection != Projection.FLAT) s /= zoom.coerceIn(0.3f, 10f)
+        s *= frustumWidthMul.coerceIn(0.3f, 3f)
+        s = s.coerceIn(0.05f, 12f)
+        val l = px + (l0 - px) * s
+        val r = px + (r0 - px) * s
+        val b = py + (b0 - py) * s
+        val t = py + (t0 - py) * s
         Matrix.frustumM(out, 0, l, r, b, t, near, far)
+        // Convergence trim: uniform clip-space offset per eye (§10). An
+        // m[8] addition shifts the image by MINUS that amount in NDC x, so
+        // the left eye takes -ct and the right +ct: positive trim converges
+        // the halves, negative diverges them.
+        val ct = convTrimNdc.coerceIn(-0.15f, 0.15f)
+        out[8] = out[8] + (if (eye == 0) -ct else ct)
     }
 
     /** (Re)creates the eye FBO at half-screen size. Failure falls back to
@@ -1345,7 +1401,11 @@ void main(){
                 xProgF = maxOf(0f, xProgF - dtMs / 600f)
                 val pin = pinTopRows.coerceIn(0, 2)
                 var idx = -1
-                if (pin > 0) {
+                // Strips mode on file pages always, and on settings pages
+                // while testing once the list overflows the plain window
+                // (no pinned rows there).
+                val stripsOn = pin > 0 || rows.size > VISIBLE_ROWS
+                if (stripsOn) {
                     // File pages: strips + pinned rows + fractional window.
                     val win = winRows(pin)
                     val ypx = v * TEX
@@ -1495,7 +1555,8 @@ void main(){
 
     private fun ensureVisible() {
         val pin = pinTopRows.coerceIn(0, 2)
-        val win = if (pin > 0) winRows(pin) else VISIBLE_ROWS
+        val stripsOn = pin > 0 || browserRows.size > VISIBLE_ROWS
+        val win = if (stripsOn) winRows(pin) else VISIBLE_ROWS
         val maxS = maxOf(0, browserRows.size - pin - win).toFloat()
         scrollPos = scrollPos.coerceIn(0f, maxS)
         val h = highlight
@@ -1951,7 +2012,9 @@ void main(){
         GLES20.glUniform1i(uStereoOes, when (stereo) { Stereo.MONO -> 0; Stereo.SBS -> 1; Stereo.TB -> 2 })
         GLES20.glUniform1i(uEyeOes, eye)
         GLES20.glUniformMatrix4fv(uTexMatOes, 1, false, texMat, 0)
-        GLES20.glUniform1f(uZoomOutOes, zoomOutF())
+        // Texture zoom lives only on the finite FLAT quad (§5); domes keep
+        // the full sampled range here and narrow the frustum instead.
+        GLES20.glUniform1f(uZoomOutOes, if (projection == Projection.FLAT) flatZoomF() else 1f)
         GLES20.glUniformMatrix4fv(uMvpOes, 1, false, mvpM, 0)
         setWarp(uWarpOnOes, uWarpCxOes, uWarpK1Oes, uWarpK2Oes, uWarpAspectOes, warpCx, aspect)
         GLES20.glEnableVertexAttribArray(aPosOes)
@@ -1975,7 +2038,7 @@ void main(){
         GLES20.glUniform1i(uStereoFish, st)
         GLES20.glUniform1i(uEyeFish, eye)
         GLES20.glUniformMatrix4fv(uTexMatFish, 1, false, texMat, 0)
-        GLES20.glUniform1f(uZoomOutFish, zoomOutF())
+        GLES20.glUniform1f(uZoomOutFish, 1f)
         GLES20.glUniformMatrix4fv(uMvpFish, 1, false, mvpM, 0)
         // Active circle: per-layout defaults (§8: half-image center, radius
         // of one quarter frame width) plus calibration offsets.
@@ -2193,7 +2256,7 @@ void main(){
         ensureVisible()
         val rows = browserRows
         val pin = pinTopRows.coerceIn(0, 2)
-        val stm = pin > 0 // strips mode: file pages only
+        val stm = pin > 0 || rows.size > VISIBLE_ROWS // strips mode
         val win = if (stm) winRows(pin) else VISIBLE_ROWS
         val base = scrollPos.toInt()
         val winStart = (pin + base).coerceAtMost(rows.size)
@@ -2656,7 +2719,7 @@ void main(){
         var wsum = 0f; var wcnt = 0
         for (a in active) if (a.n == n) { wsum += a.weight01; wcnt++ }
         if (wsum <= 0f) return m
-        // Combine on the fly per vertex (meshes are small: 25x49 sphere, 25x13 flat).
+        // Combine on the fly per vertex (meshes are small: 61x49 sphere, 25x13 flat).
         val count = m.tex.capacity() / 2
         val out = FloatArray(m.tex.capacity())
         m.tex.rewind()
@@ -2699,16 +2762,25 @@ void main(){
      *  content edge. The yaw seam (ix 0 vs ix cols) uses duplicated
      *  vertices carrying U 0 and 1, so filtering never blends across the
      *  cut; V clamps at the poles via CLAMP_TO_EDGE. */
+    /** Sphere segment mesh (§2): 60 rows by 48 columns, large-radius
+     *  sphere (50 m default, tunable to ~1 m for eye-offset parallax
+     *  experiments). U maps yaw linearly across the span, V maps pitch
+     *  linearly; pole rows are duplicated-vertex rings stopping just short
+     *  of the poles (no collapsed singularity point), leaving an invisible
+     *  pinhole. The yaw seam duplicates vertices carrying U 0 and 1. */
     private fun sphereSegment(deg: Float): Mesh {
-        val rows = 24; val cols = 48
-        val r = 50f
+        val rows = 60; val cols = 48
+        val r = domeRadiusM.coerceIn(1f, 80f)
         val yawMax = Math.toRadians((deg / 2).toDouble())
+        // Stop just short of the poles so the pole rows stay true rings of
+        // distinct vertices instead of collapsing onto one point.
+        val pitchMax = Math.PI / 2 - Math.toRadians(0.05)
         val verts = mutableListOf<Float>(); val texs = mutableListOf<Float>()
         for (iy in 0..rows) {
             val v = iy.toFloat() / rows
             // Linear pitch mapping (edge stretch removed: the Cardboard
             // pre-warp now owns all edge geometry). Centre v=0.5 = pitch 0.
-            val pitch = Math.PI * (v - 0.5f)
+            val pitch = (v - 0.5f) * 2f * pitchMax
             for (ix in 0..cols) {
                 val u = ix.toFloat() / cols
                 val yaw = -yawMax + u * 2 * yawMax

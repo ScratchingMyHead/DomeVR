@@ -53,6 +53,10 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         const val EXTRA_QUEUE_PATHS = "queue_paths"  // sibling files for prev/next
         const val EXTRA_QUEUE_INDEX = "queue_index"
         private const val TAG = "DomeVR"
+        /** Baseline fired already in this process (fresh-process detection).
+         *  Rotation recreates the activity in-process and must keep live tuning. */
+        private var baselineFiredProcess = false
+        private const val BASELINE_EXPIRY_MS = 30L * 60L * 1000L
     }
 
     private lateinit var glView: GLSurfaceView
@@ -339,6 +343,14 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         hideSystemBars()
         setContentView(R.layout.activity_vr)
         settings = SettingsStore(this)
+        // Startup baseline (§10): fresh install, fresh process, or 30-min
+        // expiry. Rotation recreates in-process and keeps live tuning.
+        if (!baselineFiredProcess) {
+            baselineFiredProcess = true
+            settings.fireBaseline(System.currentTimeMillis())
+            FileLog.i(TAG, "startup baseline fired (fresh process)")
+            Log.i(TAG, "startup baseline fired (fresh process)")
+        }
         connections = ConnectionStore(this).load()
         loadShapingShapes()
 
@@ -445,6 +457,24 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         renderer.dwellMs = settings.dwellMs
         renderer.pinVideo = settings.pinVideo
         renderer.skipSecs = settings.skipSecs
+        renderer.domeRadiusM = settings.domeRadiusM
+        renderer.domeOffsetUpM = settings.domeOffsetUpM
+        renderer.domeOffsetFwdM = settings.domeOffsetFwdM
+        renderer.domeNodeScale = settings.domeNodeScale
+        renderer.frustumWidthMul = settings.frustumWidthMul
+        renderer.eyeDepthMm = settings.eyeDepthMm
+        val dm = resources.displayMetrics
+        val pxPerMm = (dm.xdpi / 25.4f).coerceAtLeast(1f)
+        renderer.mmPerPx = 1f / pxPerMm
+        // Effective viewer lens separation (§10): zoom-derived base (63 mm
+        // at zoom ≤1, 73 mm at zoom ≥2.5, linear between) plus the manual
+        // trim. Frustum millimeter distances and warp centers derive from
+        // this; cameras stay at the wearer's IPD. Convergence itself is
+        // fully manual (Convergence slider / baseline) and never derived
+        // from zoom.
+        val zt = ((settings.videoZoom - 1f) / 1.5f).coerceIn(0f, 1f)
+        renderer.lensSepMm = 63f + 10f * zt + settings.lensSepTrimMm
+        renderer.convTrimNdc = settings.convTrim
 
         // Shaping grids: feed active set only when content changed (mesh rebuild is keyed).
         val skey = shapingShapes.filter { settings.shapeEnabled(it.id) }
@@ -468,15 +498,6 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         renderer.menuAngleDown = settings.menuAngleDown
         renderer.menuSideUp = settings.menuTop
         renderer.circleGestureEnabled = settings.circleRecenter
-        // Convergence: each screen half is its own NDC range, so move each
-        // eye's image toward its half-center until the centers sit ipdMm
-        // apart. o = 1 - ipd/spacing (NDC units), clamped to stay on-screen.
-        val dm = resources.displayMetrics
-        val pxPerMm = (dm.xdpi / 25.4f).coerceAtLeast(1f)
-        renderer.mmPerPx = 1f / pxPerMm
-        val halfPx = (if (renderer.lastWidth > 100) renderer.lastWidth else dm.widthPixels) / 2f
-        val spacingMm = (halfPx / pxPerMm).coerceAtLeast(1f)
-        renderer.convShiftNdc = ((1f - settings.ipdMm / spacingMm).coerceIn(-0.5f, 0.5f))
         // Fisheye circle calibration needs the decoded frame's aspect.
         try {
             player?.videoFormat?.let { vf ->
@@ -489,6 +510,13 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
     override fun onResume() {
         super.onResume()
         hideSystemBars()
+        // 30-minute baseline expiry (§10). Re-entry inside a session keeps
+        // live tuning (onCreate already handled the fresh-process fire).
+        if (System.currentTimeMillis() - settings.baselineAt > BASELINE_EXPIRY_MS) {
+            settings.fireBaseline(System.currentTimeMillis())
+            FileLog.i(TAG, "startup baseline fired (30-min expiry)")
+            Log.i(TAG, "startup baseline fired (30-min expiry)")
+        }
         applyOptics()
         renderer.resetBasis("entry") // next sensor reading centers the view
         connections = ConnectionStore(this).load()
@@ -877,6 +905,7 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                 action = "slide:$key", slideKey = key, slideMin = min, slideMax = max, slideVal = cur,
                 slideFmt = fmt)
         val r = mutableListOf(
+            Row("Load defaults", "reset calibration to the startup baseline", VrRenderer.BrowserRow.ACTION, action = "set:defaults"),
             Row("Video", renderer.stereo.label, VrRenderer.BrowserRow.ACTION,
                 segLabels = listOf("2D", "SBS", "TB"),
                 segActions = listOf("setstereo2:MONO", "setstereo2:SBS", "setstereo2:TB"),
@@ -895,11 +924,25 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
 
             slide("Field of view", "${settings.fovDeg.toInt()}°", "fov", 40f, 110f, settings.fovDeg,
                 VrRenderer.SlideFormat("°", 0, 1f, 0f, 1f)),
-            slide("Video size", "${String.format("%.2f", settings.videoZoom)}×", "zoom", 0.3f, 2.5f, settings.videoZoom,
+            slide("Video size", "${String.format("%.2f", settings.videoZoom)}×", "zoom", 0.3f, 10f, settings.videoZoom,
                 VrRenderer.SlideFormat("×", 2, 1f, 0f, 0.05f)),
             Row("", "", VrRenderer.BrowserRow.FILE, dead = true),
             slide("Eye separation", "${settings.ipdMm.toInt()} mm", "ipd", 40f, 80f, settings.ipdMm,
                 VrRenderer.SlideFormat(" mm", 0, 1f, 0f, 1f)),
+            slide("Lens trim", "${String.format("%+.0f", settings.lensSepTrimMm)} mm", "lenstrim", -10f, 10f, settings.lensSepTrimMm,
+                VrRenderer.SlideFormat(" mm", 0, 1f, 0f, 1f)),
+            slide("Convergence", "${String.format("%+.3f", settings.convTrim)}", "convtrim", -0.15f, 0.15f, settings.convTrim,
+                VrRenderer.SlideFormat("", 3, 1f, 0f, 0.005f)),
+            slide("Dome radius", "${String.format("%.0f", settings.domeRadiusM)} m", "domeradius", 1f, 80f, settings.domeRadiusM,
+                VrRenderer.SlideFormat(" m", 0, 1f, 0f, 1f)),
+            slide("Dome offset up", "${String.format("%.1f", settings.domeOffsetUpM)} m", "domeoffup", -5f, 5f, settings.domeOffsetUpM,
+                VrRenderer.SlideFormat(" m", 1, 1f, 0f, 0.1f)),
+            slide("Dome offset fwd", "${String.format("%.1f", settings.domeOffsetFwdM)} m", "domeofffwd", -5f, 5f, settings.domeOffsetFwdM,
+                VrRenderer.SlideFormat(" m", 1, 1f, 0f, 0.1f)),
+            slide("Dome node scale", "${String.format("%.2f", settings.domeNodeScale)}×", "domescale", 0.1f, 4f, settings.domeNodeScale,
+                VrRenderer.SlideFormat("×", 2, 1f, 0f, 0.05f)),
+            slide("Frustum width", "${String.format("%.2f", settings.frustumWidthMul)}×", "frustumw", 0.3f, 3f, settings.frustumWidthMul,
+                VrRenderer.SlideFormat("×", 2, 1f, 0f, 0.05f)),
             slide("Panel distance", "${String.format("%.1f", settings.panelDistM)} m", "panel", 1.2f, 5f, settings.panelDistM,
                 VrRenderer.SlideFormat(" m", 1, 1f, 0f, 0.1f)),
         )
@@ -1119,8 +1162,15 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
         FileLog.i("DomeVR-browser", "slide key=$key frac=$f")
         when (key) {
             "fov" -> settings.fovDeg = (40f + f * 70f).roundToInt().toFloat().coerceIn(40f, 110f)
-            "zoom" -> settings.videoZoom = ((0.3f + f * 2.2f) * 20f).roundToInt() / 20f
+            "zoom" -> settings.videoZoom = ((0.3f + f * 9.7f) * 20f).roundToInt() / 20f
             "ipd" -> settings.ipdMm = (40f + f * 40f).roundToInt().toFloat().coerceIn(40f, 80f)
+            "lenstrim" -> settings.lensSepTrimMm = ((f * 20f - 10f).roundToInt()).toFloat().coerceIn(-10f, 10f)
+            "convtrim" -> settings.convTrim = (((f * 0.3f - 0.15f) / 0.005f).roundToInt() * 0.005f).coerceIn(-0.15f, 0.15f)
+            "domeradius" -> settings.domeRadiusM = ((1f + f * 79f).roundToInt()).toFloat().coerceIn(1f, 80f)
+            "domeoffup" -> settings.domeOffsetUpM = (((-5f + f * 10f) * 10f).roundToInt() / 10f).coerceIn(-5f, 5f)
+            "domeofffwd" -> settings.domeOffsetFwdM = (((-5f + f * 10f) * 10f).roundToInt() / 10f).coerceIn(-5f, 5f)
+            "domescale" -> settings.domeNodeScale = (((0.1f + f * 3.9f) * 20f).roundToInt() / 20f).coerceIn(0.1f, 4f)
+            "frustumw" -> settings.frustumWidthMul = (((0.3f + f * 2.7f) * 20f).roundToInt() / 20f).coerceIn(0.3f, 3f)
             "panel" -> settings.panelDistM = ((1.2f + f * 3.8f) * 10f).roundToInt() / 10f
             "lensK1" -> settings.lensK1 = ((f * 100f).roundToInt() / 100f).coerceIn(0f, 1f)
             "lensK2" -> settings.lensK2 = ((f * 100f).roundToInt() / 100f).coerceIn(0f, 1f)
@@ -1246,13 +1296,25 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
             act == "set:swap" -> { settings.swapEyes = !settings.swapEyes; applyOptics(); refresh() }
             act == "set:pin" -> { settings.pinVideo = !settings.pinVideo; applyOptics(); refresh() }
             act == "set:fishmirror" -> { settings.fisheyeMirrorR = !settings.fisheyeMirrorR; applyOptics(); refresh() }
+            act == "set:defaults" -> {
+                settings.fireBaseline(System.currentTimeMillis())
+                applyOptics(); refresh()
+                renderer.showToast("Defaults loaded", 2000L)
+            }
             act.startsWith("adj:") -> {
                 val parts = act.split(":")
                 val key = parts[1]; val dir = if (parts[2] == "+") 1 else -1
                 when (key) {
                     "fov" -> settings.fovDeg = (settings.fovDeg + dir * 2f).coerceIn(40f, 110f)
                     "ipd" -> settings.ipdMm = (settings.ipdMm + dir * 1f).coerceIn(40f, 80f)
-                    "zoom" -> settings.videoZoom = (settings.videoZoom + dir * 0.1f).coerceIn(0.3f, 2.5f)
+                    "zoom" -> settings.videoZoom = (settings.videoZoom + dir * 0.1f).coerceIn(0.3f, 10f)
+                    "lenstrim" -> settings.lensSepTrimMm = (settings.lensSepTrimMm + dir * 1f).coerceIn(-10f, 10f)
+                    "convtrim" -> settings.convTrim = (settings.convTrim + dir * 0.005f).coerceIn(-0.15f, 0.15f)
+                    "domeradius" -> settings.domeRadiusM = (settings.domeRadiusM + dir * 1f).coerceIn(1f, 80f)
+                    "domeoffup" -> settings.domeOffsetUpM = (settings.domeOffsetUpM + dir * 0.1f).coerceIn(-5f, 5f)
+                    "domeofffwd" -> settings.domeOffsetFwdM = (settings.domeOffsetFwdM + dir * 0.1f).coerceIn(-5f, 5f)
+                    "domescale" -> settings.domeNodeScale = (settings.domeNodeScale + dir * 0.05f).coerceIn(0.1f, 4f)
+                    "frustumw" -> settings.frustumWidthMul = (settings.frustumWidthMul + dir * 0.05f).coerceIn(0.3f, 3f)
 
                     "panel" -> settings.panelDistM = (settings.panelDistM + dir * 0.2f).coerceIn(1.2f, 5f)
                     "lensK1" -> settings.lensK1 = (settings.lensK1 + dir * 0.02f).coerceIn(0f, 1f)
@@ -1415,8 +1477,8 @@ class VrPlayerActivity : AppCompatActivity(), SensorEventListener {
                     p.seekTo((p.currentPosition + settings.skipSecs * 1000).coerceAtMost(d))
                 }
                 7 -> stepQueue(1)
-                8 -> { settings.videoZoom = (settings.videoZoom + 0.1f).coerceIn(0.3f, 2.5f); applyOptics() }
-                9 -> { settings.videoZoom = (settings.videoZoom - 0.1f).coerceIn(0.3f, 2.5f); applyOptics() }
+                8 -> { settings.videoZoom = (settings.videoZoom + 0.1f).coerceIn(0.3f, 10f); applyOptics() }
+                9 -> { settings.videoZoom = (settings.videoZoom - 0.1f).coerceIn(0.3f, 10f); applyOptics() }
                 10 -> audioManager().adjustStreamVolume(
                     android.media.AudioManager.STREAM_MUSIC,
                     android.media.AudioManager.ADJUST_RAISE,
